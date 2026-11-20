@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to Sheetly are listed here, newest first.
 Sheetly is in early **alpha**: expect bugs, and please report them in the GitHub issues.
@@ -17,4 +17,5 @@ First public version.
 - Borders menu with icons; "Merge cells" option in Format Cells > Alignment; borders on merged cells draw correctly.
 - Windows installer about 1.2 MB, portable exe about 3.4 MB.
 
-Known gaps: no charts; the UI has only been tested by hand on a few files.
+Known gaps: no charts; Windows only (Linux and macOS planned); the UI has only been tested by hand on a few files.
+
