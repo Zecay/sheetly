@@ -1,0 +1,29 @@
+﻿name: Bug report
+description: Something in Sheetly does not work as expected
+labels: [bug, alpha]
+body:
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What did you click or type?
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: Screenshots are welcome.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Sheetly version
+      placeholder: 0.1.0-alpha
