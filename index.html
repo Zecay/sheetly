@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Book1 - Sheetly</title>
+  </head>
+  <body>
+    <div id="app">
+      <header id="titlebar" data-tauri-drag-region>
+        <div class="tb-left" data-tauri-drag-region>
+          <span id="app-mark" class="app-mark"></span>
+          <div id="qat" class="qat"></div>
+        </div>
+        <div id="doc-title" class="tb-title" data-tauri-drag-region>Book1 - Sheetly</div>
+        <div class="tb-search"><span class="tb-search-ic" id="tb-search-ic"></span><input id="tb-search" type="text" placeholder="Search" spellcheck="false" autocomplete="off" /></div>
+        <div class="tb-ctrl">
+          <button id="win-min" type="button" title="Minimize"></button>
+          <button id="win-max" type="button" title="Maximize"></button>
+          <button id="win-close" type="button" title="Close"></button>
+        </div>
+      </header>
+      <nav id="tabs" role="tablist"></nav>
+      <section id="ribbon"></section>
+      <div id="formulabar">
+        <div id="namebox-wrap"><input id="namebox" type="text" spellcheck="false" autocomplete="off" /><button id="namebox-arrow" type="button" tabindex="-1"></button></div>
+        <div id="fb-btns">
+          <button id="fb-cancel" type="button" title="Cancel" hidden></button>
+          <button id="fb-enter" type="button" title="Enter" hidden></button>
+          <button id="fb-fx" type="button" title="Insert Function"></button>
+        </div>
+        <div id="fb-input"><div id="fb-mirror"></div><textarea id="fb-ta" rows="1" spellcheck="false" autocomplete="off"></textarea></div>
+        <button id="fb-expand" type="button" title="Expand Formula Bar"></button>
+      </div>
+      <div id="gridwrap">
+        <div id="grid-area" tabindex="0"></div>
+        <div id="vscroll" class="scroll v"><div class="thumb"></div></div>
+      </div>
+      <div id="sheetbar">
+        <div class="sb-nav"><button id="sb-left" type="button" title="Scroll tabs left"></button><button id="sb-right" type="button" title="Scroll tabs right"></button></div>
+        <div id="sheet-tabs"></div>
+        <button id="sheet-add" type="button" title="New sheet"></button>
+        <div id="hscroll" class="scroll h"><div class="thumb"></div></div>
+      </div>
+      <footer id="statusbar">
+        <div id="sb-mode">Ready</div>
+        <div id="sb-msg"></div>
+        <div id="sb-stats"></div>
+        <div id="sb-views"></div>
+        <div id="sb-zoom"></div>
+      </footer>
+    </div>
+    <div id="backstage" hidden></div>
+    <div id="print-area"></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

@@ -1,0 +1,10 @@
+node_modules
+dist
+src-tauri/target
+src-tauri/gen
+*.log
+
+Sheetly.exe
+Reference/
+PROMPT-sonnet.md
+tests/stress/tmp
