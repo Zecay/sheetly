@@ -17,5 +17,5 @@ First public version.
 - Borders menu with icons; "Merge cells" option in Format Cells > Alignment; borders on merged cells draw correctly.
 - Windows installer about 1.2 MB, portable exe about 3.4 MB.
 
-Known gaps: no charts; Windows only (Linux and macOS planned); the UI has only been tested by hand on a few files.
+Known gaps: no charts; Windows only (Linux, macOS and phones planned); the UI has only been tested by hand on a few files.
 
