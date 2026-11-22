@@ -1,6 +1,6 @@
 // Editing operations on a workbook: input, clear, insert/delete, fill, sort, copy/move, find.
 import { MAX_COLS, MAX_ROWS, Rect, cellKey, keyCol, keyRow, normRect } from './addr';
-import { Cell, CFRule, Sheet, StylePatch, Workbook } from './model';
+import { Cell, CFRule, Sheet, StylePatch, Workbook, cleanSheetName } from './model';
 import { parseInput } from './input';
 import { ParseError, RefEditor, RefPart, parseFormula, rewriteRefs, shiftFormula } from './parser';
 import { FErr, Value, DAYS, MONTHS, isErr } from './values';
@@ -145,12 +145,23 @@ function structEditor(target: Sheet, home: string, axis: Axis, at: number, delta
 }
 
 function adjustRect(rect: Rect, axis: Axis, at: number, delta: number): Rect | null {
-  if (axis === 'row') {
-    const sp = mapSpan(rect.r1, rect.r2, at, delta);
-    return sp ? { ...rect, r1: sp[0], r2: sp[1] } : null;
-  }
-  const sp = mapSpan(rect.c1, rect.c2, at, delta);
-  return sp ? { ...rect, c1: sp[0], c2: sp[1] } : null;
+  const max = axis === 'row' ? MAX_ROWS : MAX_COLS;
+  const sp = axis === 'row' ? mapSpan(rect.r1, rect.r2, at, delta) : mapSpan(rect.c1, rect.c2, at, delta);
+  if (!sp || sp[0] >= max) return null; // pushed off the sheet
+  const end = Math.min(sp[1], max - 1);
+  return axis === 'row' ? { ...rect, r1: sp[0], r2: end } : { ...rect, c1: sp[0], c2: end };
+}
+
+/** Apply a formula edit to a sheet's data validations and internal hyperlinks. */
+function editSheetExtras(s: Sheet, edit: (f: string) => string): void {
+  s.validations = s.validations.map((v) => ({
+    ...v,
+    f1: v.f1 === undefined ? undefined : edit(v.f1),
+    f2: v.f2 === undefined ? undefined : edit(v.f2),
+  }));
+  s.hyperlinks = s.hyperlinks
+    .map((h) => (h.location ? { ...h, location: edit(h.location) } : h))
+    .filter((h) => !h.location?.includes('#REF!'));
 }
 
 function restructure(wb: Workbook, sheet: Sheet, axis: Axis, at: number, delta: number): void {
@@ -179,6 +190,15 @@ function restructure(wb: Workbook, sheet: Sheet, axis: Axis, at: number, delta: 
   // merges, cf, filter
   sheet.merges = sheet.merges.map((m) => adjustRect(m, axis, at, delta)).filter((m): m is Rect => !!m);
   sheet.cf = sheet.cf.map((r) => ({ ...r, rect: adjustRect(r.rect, axis, at, delta)! })).filter((r) => r.rect);
+  sheet.hyperlinks = sheet.hyperlinks.map((h) => ({ ...h, rect: adjustRect(h.rect, axis, at, delta)! })).filter((h) => h.rect);
+  sheet.validations = sheet.validations
+    .map((v) => ({ ...v, rects: v.rects.map((x) => adjustRect(x, axis, at, delta)).filter((x): x is Rect => !!x) }))
+    .filter((v) => v.rects.length);
+  sheet.comments = sheet.comments.flatMap((n) => {
+    const v = mapCoord(axis === 'row' ? n.r : n.c, at, delta);
+    if (v === null || v >= max) return [];
+    return [axis === 'row' ? { ...n, r: v } : { ...n, c: v }];
+  });
   if (sheet.filter) {
     const nr = adjustRect(sheet.filter.rect, axis, at, delta);
     if (nr) sheet.filter.rect = nr;
@@ -194,11 +214,12 @@ function restructure(wb: Workbook, sheet: Sheet, axis: Axis, at: number, delta: 
       const nf = rewriteRefs(cell.f, edit);
       if (nf !== cell.f) s.cells.set(k, { v: cell.v, f: nf, s: cell.s });
     }
+    editSheetExtras(s, (f) => rewriteRefs(f, edit));
   }
-  const nameEdit = structEditor(sheet, '', axis, at, delta);
   for (const [k, def] of Array.from(wb.names.entries())) {
-    const nf = rewriteRefs(def.refers, nameEdit);
-    if (nf !== def.refers) wb.names.set(k, { name: def.name, refers: nf });
+    const home = def.scope !== undefined ? wb.sheetById(def.scope)?.name ?? '' : '';
+    const nf = rewriteRefs(def.refers, structEditor(sheet, home, axis, at, delta));
+    if (nf !== def.refers) wb.names.set(k, { ...def, refers: nf });
   }
   wb.rebuildDeps();
   wb.requestFullRecalc();
@@ -231,13 +252,22 @@ export function renameSheet(wb: Workbook, sheet: Sheet, newName: string): void {
         const nf = renameSheetRefs(cell.f, ol, newName);
         if (nf !== cell.f) s.cells.set(k, { v: cell.v, f: nf, s: cell.s });
       }
+    for (const s of wb.sheets) editSheetExtras(s, (f) => renameSheetRefs(f, ol, newName));
     for (const [k, def] of Array.from(wb.names.entries())) {
       const nf = renameSheetRefs(def.refers, ol, newName);
-      if (nf !== def.refers) wb.names.set(k, { name: def.name, refers: nf });
+      if (nf !== def.refers) wb.names.set(k, { ...def, refers: nf });
     }
     wb.rebuildDeps();
     wb.requestFullRecalc();
   }, true);
+}
+
+/** Make every sheet name legal for Excel, updating the formulas that mention it. */
+export function normalizeSheetNames(wb: Workbook): void {
+  for (const s of wb.sheets) {
+    const clean = wb.uniqueSheetName(cleanSheetName(s.name), s);
+    if (clean !== s.name) renameSheet(wb, s, clean);
+  }
 }
 
 import { renameSheetInFormula } from './parser';
@@ -252,12 +282,23 @@ export function deleteSheet(wb: Workbook, sheet: Sheet): void {
     const nameL = sheet.name.toLowerCase();
     wb.sheets.splice(idx, 1);
     // formulas pointing at the deleted sheet become #REF!
-    for (const s of wb.sheets)
+    const edit: RefEditor = (sn, a, b) => (sn !== undefined && sn.toLowerCase() === nameL ? null : { a, b });
+    for (const s of wb.sheets) {
       for (const [k, cell] of s.cells) {
         if (cell.f === undefined) continue;
-        const nf = rewriteRefs(cell.f, (sn, a, b) => (sn !== undefined && sn.toLowerCase() === nameL ? null : { a, b }));
+        const nf = rewriteRefs(cell.f, edit);
         if (nf !== cell.f) s.cells.set(k, { v: cell.v, f: nf, s: cell.s });
       }
+      editSheetExtras(s, (f) => rewriteRefs(f, edit));
+    }
+    for (const [k, def] of Array.from(wb.names.entries())) {
+      if (def.scope === sheet.id) {
+        wb.names.delete(k);
+        continue;
+      }
+      const nf = rewriteRefs(def.refers, edit);
+      if (nf !== def.refers) wb.names.set(k, { ...def, refers: nf });
+    }
     wb.rebuildDeps();
     wb.requestFullRecalc();
   }, true);
@@ -276,12 +317,18 @@ export function duplicateSheet(wb: Workbook, sheet: Sheet): Sheet {
     const idx = wb.sheets.indexOf(sheet);
     const copy = wb.addSheet(wb.uniqueSheetName(sheet.name), idx + 1);
     for (const [k, cell] of sheet.cells) copy.cells.set(k, { v: cell.v, f: cell.f, s: cell.s });
+    copy.cols.def = sheet.cols.def;
+    copy.rows.def = sheet.rows.def;
     copy.cols.sizes = new Map(sheet.cols.sizes);
     copy.rows.sizes = new Map(sheet.rows.sizes);
     copy.cols.touch();
     copy.rows.touch();
     copy.merges = sheet.merges.map((m) => ({ ...m }));
     copy.cf = sheet.cf.map((c) => ({ ...c, rect: { ...c.rect }, id: wb.nextRuleId++ }));
+    copy.hyperlinks = sheet.hyperlinks.map((h) => ({ ...h, rect: { ...h.rect } }));
+    copy.comments = sheet.comments.map((n) => ({ ...n }));
+    copy.validations = sheet.validations.map((v) => ({ ...v, rects: v.rects.map((x) => ({ ...x })) }));
+    for (const def of Array.from(wb.names.values())) if (def.scope === sheet.id) wb.setName(def.name, def.refers, copy.id);
     copy.freezeRows = sheet.freezeRows;
     copy.freezeCols = sheet.freezeCols;
     copy.tabColor = sheet.tabColor;

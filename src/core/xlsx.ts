@@ -1,11 +1,70 @@
 // .xlsx reader and writer (values, formulas, basic formatting, widths, merges, names, simple conditional formats).
 import { strFromU8, strToU8, unzipSync, zipSync } from 'fflate';
 import { MAX_COLS, MAX_ROWS, Rect, a1, cellKey, colIndex, colName, keyCol, keyRow, parseCell, parseRect, rectText } from './addr';
-import { BUILTIN_FORMATS } from './numfmt';
-import { Border, CFRule, Cell, CellStyle, Sheet, Workbook } from './model';
+import { BUILTIN_FORMATS, isDateFormat } from './numfmt';
+import { Border, CFRule, Cell, CellComment, CellStyle, DataValidation, Hyperlink, Sheet, Workbook, cleanSheetName, clipText, isValidDefinedName } from './model';
+import { normalizeSheetNames } from './ops';
 import { XNode, child, esc, escText, kids, parseXml } from './xml';
-import { E, FErr, Value, errFromCode } from './values';
+import { E, FErr, Value, errFromCode, ymdToSerial } from './values';
 import { shiftFormula, tokenize } from './parser';
+
+// Excel's limits
+const MAX_CELL_TEXT = 32767;
+const MAX_ROW_POINTS = 409.5;
+const MAX_COL_WIDTH = 255;
+const MAX_HYPERLINKS = 65530;
+const DATE1904_OFFSET = 1462;
+const XLSX_ERRORS = new Set(['#NULL!', '#DIV/0!', '#VALUE!', '#REF!', '#NAME?', '#NUM!', '#N/A']);
+const DV_ATTRS = ['type', 'errorStyle', 'imeMode', 'operator', 'allowBlank', 'showDropDown', 'showInputMessage', 'showErrorMessage', 'errorTitle', 'error', 'promptTitle', 'prompt'];
+
+/** Keep the first of any overlapping merges and drop single-cell ones: Excel repairs a file containing either. */
+function cleanMerges(list: Rect[]): Rect[] {
+  const order = list.map((m, i) => ({ m, i })).sort((a, b) => a.m.r1 - b.m.r1 || a.i - b.i);
+  const dropped = new Set<number>();
+  let active: Rect[] = [];
+  for (const { m, i } of order) {
+    if (m.r1 === m.r2 && m.c1 === m.c2) {
+      dropped.add(i);
+      continue;
+    }
+    active = active.filter((a) => a.r2 >= m.r1);
+    if (active.some((a) => a.c1 <= m.c2 && a.c2 >= m.c1)) dropped.add(i);
+    else active.push(m);
+  }
+  return dropped.size ? list.filter((_, i) => !dropped.has(i)) : list;
+}
+
+/** True for formats that show a calendar date (time-only and elapsed formats are not shifted for 1904). */
+function hasDatePart(fmt: string): boolean {
+  if (!isDateFormat(fmt) || /\[(h+|m+|s+)\]/i.test(fmt)) return false;
+  const bare = fmt.replace(/"[^"]*"|\\.|\[[^\]]*\]|AM\/PM|A\/P/gi, '').toLowerCase();
+  return /[yd]/.test(bare) || (bare.includes('m') && !/[hs]/.test(bare));
+}
+
+/** Parse the ISO 8601 value of a t="d" cell into a 1900-system serial. */
+function parseIsoDate(s: string): { serial: number; time: boolean } | null {
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}(?:\.\d+)?))?)?(?:Z|[+-]\d{2}:?\d{2})?$/.exec(s.trim());
+  if (!m) return null;
+  const [y, mo, d] = [+m[1], +m[2], +m[3]];
+  const dt = new Date(Date.UTC(y, mo - 1, d));
+  if (dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d) return null;
+  const serial = ymdToSerial(y, mo, d);
+  if (serial < 1) return null;
+  const [h, mi, sec] = [+(m[4] ?? 0), +(m[5] ?? 0), +(m[6] ?? 0)];
+  if (h > 23 || mi > 59 || sec >= 60) return null;
+  return { serial: serial + (h * 3600 + mi * 60 + sec) / 86400, time: m[4] !== undefined };
+}
+
+/** Resolve a relationship target against the part that owns it. */
+function resolvePart(base: string, target: string): string {
+  if (target.startsWith('/')) return target.slice(1);
+  const parts = base.split('/').slice(0, -1);
+  for (const seg of target.split('/')) {
+    if (seg === '..') parts.pop();
+    else if (seg !== '.') parts.push(seg);
+  }
+  return parts.join('/');
+}
 
 // ---------------- colours ----------------
 
@@ -137,6 +196,7 @@ export function readXlsx(data: Uint8Array): Workbook {
 
   // styles
   const xfStyle: number[] = [];
+  const xfIsDate: boolean[] = [];
   const dxfs: { color?: string; fill?: string; bold?: boolean; italic?: boolean }[] = [];
   const stylesXml = get('xl/styles.xml');
   if (stylesXml) {
@@ -171,6 +231,7 @@ export function readXlsx(data: Uint8Array): Workbook {
       const nid = parseInt(xf.attrs.numFmtId ?? '0', 10);
       const code = numFmts.get(nid) ?? BUILTIN_FORMATS[nid];
       if (code && code !== 'General') st.fmt = code;
+      xfIsDate.push(!!code && hasDatePart(code));
       const al = child(xf, 'alignment');
       if (al) {
         const h = al.attrs.horizontal;
@@ -198,26 +259,38 @@ export function readXlsx(data: Uint8Array): Workbook {
 
   // sheets
   const sheetNodes = kids(child(wbNode, 'sheets'), 'sheet');
-  const parsedSheets: { sheet: Sheet; xml: XNode }[] = [];
+  const parsedSheets: { sheet: Sheet; xml: XNode; path: string }[] = [];
   for (const sn of sheetNodes) {
     const rid = sn.attrs['r:id'] ?? sn.attrs.id;
     let target = rels.get(rid) ?? '';
     if (target.startsWith('/')) target = target.slice(1);
     else if (!target.startsWith('xl/')) target = 'xl/' + target;
     const xml = get(target);
-    const sheet = wb.addSheet(wb.uniqueSheetName(sn.attrs.name || 'Sheet'));
-    if (xml) parsedSheets.push({ sheet, xml: parseXml(xml) });
+    // keep the file's spelling for now so formulas still match; normalizeSheetNames fixes both below
+    const raw = sn.attrs.name || 'Sheet';
+    const sheet = wb.addSheet(wb.sheetByName(raw) ? wb.uniqueSheetName(cleanSheetName(raw)) : raw);
+    if (xml) parsedSheets.push({ sheet, xml: parseXml(xml), path: target });
   }
   if (!wb.sheets.length) wb.addSheet('Sheet1');
 
-  for (const { sheet, xml } of parsedSheets) readSheet(wb, sheet, xml, sst, xfStyle, dxfs, theme);
+  const pr = child(wbNode, 'workbookPr')?.attrs.date1904;
+  const date1904 = pr === '1' || pr === 'true';
+  for (const { sheet, xml, path } of parsedSheets) {
+    readSheet(wb, sheet, xml, sst, xfStyle, dxfs, theme, date1904 ? xfIsDate : null);
+    readSheetExtras(sheet, xml, path, get);
+  }
 
   // defined names
   for (const dn of kids(child(wbNode, 'definedNames'), 'definedName')) {
     const name = dn.attrs.name;
     if (!name || name.startsWith('_xlnm') || dn.attrs.hidden === '1') continue;
-    if (!wb.getName(name)) wb.setName(name, stripXlfn(dn.text.replace(/^=/, '')));
+    const local = dn.attrs.localSheetId;
+    const scope = local === undefined ? undefined : wb.sheets[parseInt(local, 10)]?.id;
+    if (local !== undefined && scope === undefined) continue; // points at a sheet that does not exist
+    const key = (scope === undefined ? '' : scope + '!') + name.toLowerCase();
+    if (!wb.names.has(key)) wb.setName(name, stripXlfn(dn.text.replace(/^=/, '')), scope);
   }
+  normalizeSheetNames(wb);
   wb.rebuildDeps();
   wb.recalcAll();
   wb.clearHistory();
@@ -228,7 +301,51 @@ function stripXlfn(f: string): string {
   return f.replace(/_xlfn\.|_xlws\./g, '');
 }
 
-function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfStyle: number[], dxfs: any[], theme: string[]): void {
+/** Hyperlinks, comments and data validation of one worksheet. */
+function readSheetExtras(sheet: Sheet, root: XNode, path: string, get: (name: string) => string | undefined): void {
+  const slash = path.lastIndexOf('/');
+  const relXml = get(`${path.slice(0, slash)}/_rels/${path.slice(slash + 1)}.rels`);
+  const rels = relXml ? kids(parseXml(relXml), 'Relationship') : [];
+  for (const h of kids(child(root, 'hyperlinks'), 'hyperlink')) {
+    const rect = parseRect(h.attrs.ref ?? '');
+    if (!rect) continue;
+    const rid = h.attrs['r:id'] ?? h.attrs.id;
+    const target = rid ? rels.find((x) => x.attrs.Id === rid)?.attrs.Target : undefined;
+    if (!target && !h.attrs.location) continue;
+    const link: Hyperlink = { rect };
+    if (target) link.target = target;
+    if (h.attrs.location) link.location = h.attrs.location;
+    if (h.attrs.display) link.display = h.attrs.display;
+    if (h.attrs.tooltip) link.tooltip = h.attrs.tooltip;
+    sheet.hyperlinks.push(link);
+  }
+  const commentRel = rels.find((x) => (x.attrs.Type ?? '').endsWith('/comments'));
+  const commentXml = commentRel ? get(resolvePart(path, commentRel.attrs.Target)) : undefined;
+  if (commentXml) {
+    const doc = parseXml(commentXml);
+    const authors = kids(child(doc, 'authors'), 'author').map((a) => a.text);
+    for (const n of kids(child(doc, 'commentList'), 'comment')) {
+      const at = parseCell(n.attrs.ref ?? '');
+      const body = child(n, 'text');
+      if (!at || !body) continue;
+      sheet.comments.push({ r: at.r, c: at.c, author: authors[parseInt(n.attrs.authorId ?? '0', 10)] ?? '', text: textOf(body) });
+    }
+  }
+  for (const d of kids(child(root, 'dataValidations'), 'dataValidation')) {
+    const rects = (d.attrs.sqref ?? '').split(/\s+/).map(parseRect).filter((x): x is Rect => !!x);
+    if (!rects.length) continue;
+    const attrs: Record<string, string> = {};
+    for (const k of DV_ATTRS) if (d.attrs[k] !== undefined) attrs[k] = d.attrs[k];
+    const v: DataValidation = { rects, attrs };
+    const f1 = child(d, 'formula1')?.text;
+    const f2 = child(d, 'formula2')?.text;
+    if (f1 !== undefined) v.f1 = f1;
+    if (f2 !== undefined) v.f2 = f2;
+    sheet.validations.push(v);
+  }
+}
+
+function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfStyle: number[], dxfs: any[], theme: string[], shiftDates: boolean[] | null): void {
   const tab = child(child(root, 'sheetPr'), 'tabColor');
   const tc = readColor(tab, theme);
   if (tc) sheet.tabColor = tc;
@@ -245,6 +362,8 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
   const fmtPr = child(root, 'sheetFormatPr');
   const defH = fmtPr?.attrs.defaultRowHeight ? parseFloat(fmtPr.attrs.defaultRowHeight) * (4 / 3) : 20;
   if (Math.abs(defH - 20) > 0.5) sheet.rows.def = Math.round(defH);
+  const defW = parseFloat(fmtPr?.attrs.defaultColWidth ?? '');
+  if (defW > 0) sheet.cols.def = Math.round(Math.min(defW, MAX_COL_WIDTH) * 7 + 5);
   // columns
   for (const col of kids(child(root, 'cols'), 'col')) {
     const min = parseInt(col.attrs.min, 10) - 1;
@@ -279,7 +398,8 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
       } else col = cIdx + 1;
       cIdx = col;
       if (r >= MAX_ROWS || r < 0 || col >= MAX_COLS || col < 0) continue;
-      const s = c.attrs.s ? xfStyle[parseInt(c.attrs.s, 10)] : undefined;
+      const xfId = parseInt(c.attrs.s ?? '0', 10);
+      let s = c.attrs.s ? xfStyle[xfId] : undefined;
       const t = c.attrs.t;
       const fNode = child(c, 'f');
       const vNode = child(c, 'v');
@@ -293,9 +413,16 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
       else if (t === 'inlineStr') v = textOf(child(c, 'is') ?? { tag: 'is', attrs: {}, children: [], text: '' });
       else if (t === 'b') v = vt === '1';
       else if (t === 'e') v = errFromCode(vt) ?? E.VALUE;
-      else if (vNode && vt !== '') {
+      else if (t === 'd') {
+        // ISO dates are absolute, so the 1904 offset does not apply
+        const d = parseIsoDate(vt);
+        if (d) {
+          v = d.serial;
+          if (!wb.styleOf(s).fmt) s = wb.patchStyle(s, { fmt: d.time ? 'm/d/yyyy h:mm' : 'm/d/yyyy' });
+        } else if (vt !== '') v = vt;
+      } else if (vNode && vt !== '') {
         const num = parseFloat(vt);
-        v = Number.isNaN(num) ? vt : num;
+        v = Number.isNaN(num) ? vt : shiftDates?.[xfId] ? num + DATE1904_OFFSET : num;
       }
       let f: string | undefined;
       if (fNode) {
@@ -322,8 +449,9 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
   // merges
   for (const m of kids(child(root, 'mergeCells'), 'mergeCell')) {
     const r = parseRect(m.attrs.ref ?? '');
-    if (r && (r.r2 > r.r1 || r.c2 > r.c1)) sheet.merges.push(r);
+    if (r) sheet.merges.push(r);
   }
+  sheet.merges = cleanMerges(sheet.merges);
   // auto filter
   const af = child(root, 'autoFilter');
   if (af?.attrs.ref) {
@@ -391,17 +519,129 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
 
 const XLFN = new Set(['IFS', 'CONCAT', 'TEXTJOIN', 'MAXIFS', 'MINIFS', 'SWITCH', 'XLOOKUP', 'XMATCH', 'IFNA', 'DAYS', 'NUMBERVALUE', 'XOR', 'STDEV.S', 'STDEV.P', 'VAR.S', 'VAR.P']);
 
-function addXlfn(f: string): string {
+/** Formula text for the file: adds _xlfn. prefixes and applies renamed defined names. */
+function addXlfn(f: string, renamed?: Map<string, string>): string {
   let out = '';
   let pos = 0;
   for (const t of tokenize(f)) {
     if (t.kind === 'func' && XLFN.has(t.text.toUpperCase())) {
       out += f.slice(pos, t.start) + '_xlfn.' + t.text;
       pos = t.end;
+    } else if (t.kind === 'name' && renamed?.has(t.text.toLowerCase())) {
+      out += f.slice(pos, t.start) + renamed.get(t.text.toLowerCase());
+      pos = t.end;
     }
   }
   return out + f.slice(pos);
 }
+
+function xlsxError(code: string): string {
+  if (XLSX_ERRORS.has(code)) return code;
+  return code === '#CIRC!' ? '#REF!' : '#VALUE!';
+}
+
+/** Names Excel would reject get a legal replacement; formulas are rewritten to match when saving. */
+function legalNames(wb: Workbook): Map<string, string> {
+  const out = new Map<string, string>();
+  const taken = new Set(Array.from(wb.names.values()).map((n) => n.name.toLowerCase()));
+  for (const def of wb.names.values()) {
+    const l = def.name.toLowerCase();
+    if (out.has(l) || isValidDefinedName(def.name)) continue;
+    const base = '_' + def.name.replace(/[^\p{L}\p{N}_.]/gu, '_').slice(0, 240);
+    let safe = base;
+    for (let i = 2; taken.has(safe.toLowerCase()); i++) safe = base + '_' + i;
+    taken.add(safe.toLowerCase());
+    out.set(l, safe);
+  }
+  return out;
+}
+
+interface SheetExtras {
+  beforeMargins: string; // <dataValidations> and <hyperlinks>
+  afterMargins: string; // <legacyDrawing>
+  rels: string;
+  commentsXml?: string;
+  vmlXml?: string;
+  blocks: number; // VML shape-id blocks used
+}
+
+function commentParts(notes: CellComment[], firstBlock: number): { commentsXml: string; vmlXml: string; blocks: number } {
+  const authors: string[] = [];
+  const authorId = (a: string) => {
+    let i = authors.indexOf(a);
+    if (i < 0) i = authors.push(a) - 1;
+    return i;
+  };
+  let list = '';
+  let shapes = '';
+  notes.forEach((n, i) => {
+    list += `<comment ref="${a1(n.r, n.c)}" authorId="${authorId(n.author)}" shapeId="0"><text><t xml:space="preserve">${escText(clipText(n.text, MAX_CELL_TEXT))}</t></text></comment>`;
+    const id = (firstBlock + Math.floor(i / 1024)) * 1024 + (i % 1024) + 1;
+    const left = Math.min(n.c + 1, MAX_COLS - 3);
+    const top = Math.min(Math.max(n.r - 1, 0), MAX_ROWS - 5);
+    shapes += `<v:shape id="_x0000_s${id}" type="#_x0000_t202" style="position:absolute;margin-left:60pt;margin-top:2pt;width:110pt;height:60pt;z-index:${i + 1};visibility:hidden" fillcolor="#ffffe1" o:insetmode="auto"><v:fill color2="#ffffe1"/><v:shadow on="t" color="black" obscured="t"/><v:path o:connecttype="none"/><v:textbox style="mso-direction-alt:auto"><div style="text-align:left"></div></v:textbox><x:ClientData ObjectType="Note"><x:MoveWithCells/><x:SizeWithCells/><x:Anchor>${left}, 15, ${top}, 2, ${left + 2}, 15, ${top + 4}, 4</x:Anchor><x:AutoFill>False</x:AutoFill><x:Row>${n.r}</x:Row><x:Column>${n.c}</x:Column></x:ClientData></v:shape>`;
+  });
+  const blocks = Math.ceil(notes.length / 1024);
+  const idmap = Array.from({ length: blocks }, (_, i) => firstBlock + i).join(',');
+  return {
+    commentsXml: `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<comments xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><authors>${authors.map((a) => `<author>${escText(a)}</author>`).join('')}</authors><commentList>${list}</commentList></comments>`,
+    vmlXml: `<xml xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel"><o:shapelayout v:ext="edit"><o:idmap v:ext="edit" data="${idmap}"/></o:shapelayout><v:shapetype id="_x0000_t202" coordsize="21600,21600" o:spt="202" path="m,l,21600r21600,l21600,xe"><v:stroke joinstyle="miter"/><v:path gradientshapeok="t" o:connecttype="rect"/></v:shapetype>${shapes}</xml>`,
+    blocks,
+  };
+}
+
+function sheetExtras(sheet: Sheet, index: number, firstBlock: number): SheetExtras {
+  const REL = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+  const relList: string[] = [];
+  const addRel = (type: string, target: string, external = false) => {
+    const id = `rId${relList.length + 1}`;
+    relList.push(`<Relationship Id="${id}" Type="${REL}/${type}" Target="${esc(target)}"${external ? ' TargetMode="External"' : ''}/>`);
+    return id;
+  };
+  let before = '';
+  if (sheet.validations.length) {
+    before += `<dataValidations count="${sheet.validations.length}">`;
+    for (const v of sheet.validations) {
+      const attrs = DV_ATTRS.filter((k) => v.attrs[k] !== undefined).map((k) => ` ${k}="${esc(v.attrs[k]).replace(BAD_ATTR, '')}"`).join('');
+      before += `<dataValidation${attrs} sqref="${v.rects.map(rectText).join(' ')}">`;
+      if (v.f1 !== undefined) before += `<formula1>${escText(v.f1)}</formula1>`;
+      if (v.f2 !== undefined) before += `<formula2>${escText(v.f2)}</formula2>`;
+      before += '</dataValidation>';
+    }
+    before += '</dataValidations>';
+  }
+  const links = sheet.hyperlinks.filter((h) => h.target || h.location).slice(0, MAX_HYPERLINKS);
+  if (links.length) {
+    before += '<hyperlinks>';
+    for (const h of links) {
+      before += `<hyperlink ref="${rectText(h.rect)}"`;
+      if (h.target) before += ` r:id="${addRel('hyperlink', h.target, true)}"`;
+      if (h.location) before += ` location="${esc(h.location)}"`;
+      if (h.display) before += ` display="${esc(h.display)}"`;
+      if (h.tooltip) before += ` tooltip="${esc(h.tooltip)}"`;
+      before += '/>';
+    }
+    before += '</hyperlinks>';
+  }
+  const out: SheetExtras = { beforeMargins: before, afterMargins: '', rels: '', blocks: 0 };
+  // one note per cell, in row then column order
+  const byCell = new Map<number, CellComment>();
+  for (const n of sheet.comments) if (!byCell.has(cellKey(n.r, n.c))) byCell.set(cellKey(n.r, n.c), n);
+  const notes = Array.from(byCell.keys()).sort((a, b) => a - b).map((k) => byCell.get(k)!);
+  if (notes.length) {
+    const parts = commentParts(notes, firstBlock);
+    out.commentsXml = parts.commentsXml;
+    out.vmlXml = parts.vmlXml;
+    out.blocks = parts.blocks;
+    addRel('comments', `../comments${index}.xml`);
+    out.afterMargins = `<legacyDrawing r:id="${addRel('vmlDrawing', `../drawings/vmlDrawing${index}.vml`)}"/>`;
+  }
+  if (relList.length) out.rels = `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">${relList.join('')}</Relationships>`;
+  return out;
+}
+
+// eslint-disable-next-line no-control-regex
+const BAD_ATTR = /[\x00-\x08\x0b\x0c\x0e-\x1f]/g;
 
 const REV_BUILTIN = new Map<string, number>();
 for (const [id, code] of Object.entries(BUILTIN_FORMATS)) if (!REV_BUILTIN.has(code)) REV_BUILTIN.set(code, parseInt(id, 10));
@@ -517,19 +757,25 @@ export function writeXlsx(wb: Workbook): Uint8Array {
   const dxfOf = (st: NonNullable<CFRule['style']>): number => {
     let x = '<dxf>';
     if (st.bold || st.italic || st.color) {
-      x += '<font>' + (st.bold ? '<b/>' : '') + (st.italic ? '<i/>' : '') + (st.color ? `<color rgb="${hex6(st.color)}"/>` : '') + '</font>';
+      const fc = hex6(st.color);
+      x += '<font>' + (st.bold ? '<b/>' : '') + (st.italic ? '<i/>' : '') + (fc ? `<color rgb="${fc}"/>` : '') + '</font>';
     }
-    if (st.fill) x += `<fill><patternFill><bgColor rgb="${hex6(st.fill)}"/></patternFill></fill>`;
+    const bg = hex6(st.fill);
+    if (bg) x += `<fill><patternFill><bgColor rgb="${bg}"/></patternFill></fill>`;
     x += '</dxf>';
     return intern(dxfs, dxfIdx, x);
   };
 
   // ----- sheets -----
+  const renamedNames = legalNames(wb);
   const sheetXmls: string[] = [];
-  wb.sheets.forEach((sheet) => {
+  const extras: SheetExtras[] = [];
+  let vmlBlock = 1;
+  wb.sheets.forEach((sheet, sheetIdx) => {
     const rect = sheet.usedRect();
     let x = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">';
-    if (sheet.tabColor) x += `<sheetPr><tabColor rgb="${hex6(sheet.tabColor)}"/></sheetPr>`;
+    const tabRgb = hex6(sheet.tabColor);
+    if (tabRgb) x += `<sheetPr><tabColor rgb="${tabRgb}"/></sheetPr>`;
     x += `<dimension ref="${rect ? rectText(rect) : 'A1'}"/>`;
     x += '<sheetViews><sheetView workbookViewId="0"' + (sheet.showGrid ? '' : ' showGridLines="0"') + (sheet === wb.sheets[0] ? ' tabSelected="1"' : '') + '>';
     if (sheet.freezeRows || sheet.freezeCols) {
@@ -538,7 +784,8 @@ export function writeXlsx(wb: Workbook): Uint8Array {
       x += `<pane${sheet.freezeCols ? ` xSplit="${sheet.freezeCols}"` : ''}${sheet.freezeRows ? ` ySplit="${sheet.freezeRows}"` : ''} topLeftCell="${tl}" activePane="${pane}" state="frozen"/>`;
     }
     x += '</sheetView></sheetViews>';
-    x += `<sheetFormatPr defaultRowHeight="${num(sheet.rows.def * 0.75)}"/>`;
+    const defColAttr = sheet.cols.def !== 64 ? ` defaultColWidth="${num(Math.min(Math.round(((sheet.cols.def - 5) / 7) * 1e6) / 1e6, MAX_COL_WIDTH))}"` : '';
+    x += `<sheetFormatPr${defColAttr} defaultRowHeight="${num(Math.min(sheet.rows.def * 0.75, MAX_ROW_POINTS))}"/>`;
     // columns: group consecutive equal widths
     const colIdxs = Array.from(sheet.cols.sizes.keys()).sort((a, b) => a - b);
     if (colIdxs.length) {
@@ -549,7 +796,7 @@ export function writeXlsx(wb: Workbook): Uint8Array {
         while (j + 1 < colIdxs.length && colIdxs[j + 1] === colIdxs[j] + 1 && sheet.cols.sizes.get(colIdxs[j + 1]) === sheet.cols.sizes.get(colIdxs[i])) j++;
         const px = sheet.cols.sizes.get(colIdxs[i])!;
         if (px === 0) x += `<col min="${colIdxs[i] + 1}" max="${colIdxs[j] + 1}" width="9.140625" hidden="1" customWidth="1"/>`;
-        else x += `<col min="${colIdxs[i] + 1}" max="${colIdxs[j] + 1}" width="${num(Math.round(((px - 5) / 7) * 1e6) / 1e6)}" customWidth="1"/>`;
+        else x += `<col min="${colIdxs[i] + 1}" max="${colIdxs[j] + 1}" width="${num(Math.max(0, Math.min(Math.round(((px - 5) / 7) * 1e6) / 1e6, MAX_COL_WIDTH)))}" customWidth="1"/>`;
         i = j + 1;
       }
       x += '</cols>';
@@ -565,7 +812,7 @@ export function writeXlsx(wb: Workbook): Uint8Array {
       const sz = sheet.rows.sizes.get(r);
       let attrs = ` r="${r + 1}"`;
       if (sz === 0) attrs += ' hidden="1"';
-      else if (sz !== undefined) attrs += ` ht="${num(sz * 0.75)}" customHeight="1"`;
+      else if (sz !== undefined) attrs += ` ht="${num(Math.min(sz * 0.75, MAX_ROW_POINTS))}" customHeight="1"`;
       let cx = '';
       while (ki < keys.length && keyRow(keys[ki]) < r) ki++;
       while (ki < keys.length && keyRow(keys[ki]) === r) {
@@ -574,25 +821,27 @@ export function writeXlsx(wb: Workbook): Uint8Array {
         const c = keyCol(k);
         const sAttr = cell.s ? ` s="${styleXf(cell.s)}"` : '';
         const ref = a1(r, c);
-        const v = typeof cell.v === 'number' && !Number.isFinite(cell.v) ? E.NUM : cell.v;
+        const raw = typeof cell.v === 'number' && !Number.isFinite(cell.v) ? E.NUM : cell.v;
+        const v = typeof raw === 'string' ? clipText(raw, MAX_CELL_TEXT) : raw;
         if (cell.f !== undefined) {
-          const fx = `<f>${escText(addXlfn(cell.f))}</f>`;
+          const fx = `<f>${escText(addXlfn(cell.f, renamedNames))}</f>`;
           if (typeof v === 'number') cx += `<c r="${ref}"${sAttr}>${fx}<v>${num(v)}</v></c>`;
           else if (typeof v === 'string') cx += `<c r="${ref}"${sAttr} t="str">${fx}<v>${escText(v)}</v></c>`;
           else if (typeof v === 'boolean') cx += `<c r="${ref}"${sAttr} t="b">${fx}<v>${v ? 1 : 0}</v></c>`;
-          else if (v instanceof FErr) cx += `<c r="${ref}"${sAttr} t="e">${fx}<v>${esc(v.code === '#CIRC!' ? '#REF!' : v.code)}</v></c>`;
+          else if (v instanceof FErr) cx += `<c r="${ref}"${sAttr} t="e">${fx}<v>${esc(xlsxError(v.code))}</v></c>`;
           else cx += `<c r="${ref}"${sAttr}>${fx}</c>`;
         } else if (v === null) cx += `<c r="${ref}"${sAttr}/>`;
         else if (typeof v === 'number') cx += `<c r="${ref}"${sAttr}><v>${num(v)}</v></c>`;
         else if (typeof v === 'string') cx += `<c r="${ref}"${sAttr} t="s"><v>${sstOf(v)}</v></c>`;
         else if (typeof v === 'boolean') cx += `<c r="${ref}"${sAttr} t="b"><v>${v ? 1 : 0}</v></c>`;
-        else cx += `<c r="${ref}"${sAttr} t="e"><v>${esc(v.code)}</v></c>`;
+        else cx += `<c r="${ref}"${sAttr} t="e"><v>${esc(xlsxError(v.code))}</v></c>`;
       }
       x += cx ? `<row${attrs}>${cx}</row>` : `<row${attrs}/>`;
     }
     x += '</sheetData>';
     if (sheet.filter) x += `<autoFilter ref="${rectText(sheet.filter.rect)}"/>`;
-    if (sheet.merges.length) x += `<mergeCells count="${sheet.merges.length}">${sheet.merges.map((m) => `<mergeCell ref="${rectText(m)}"/>`).join('')}</mergeCells>`;
+    const merges = cleanMerges(sheet.merges);
+    if (merges.length) x += `<mergeCells count="${merges.length}">${merges.map((m) => `<mergeCell ref="${rectText(m)}"/>`).join('')}</mergeCells>`;
     let prio = 1;
     for (const rule of sheet.cf) {
       const sq = rectText(rule.rect);
@@ -620,20 +869,27 @@ export function writeXlsx(wb: Workbook): Uint8Array {
           body = `<cfRule type="uniqueValues"${st} priority="${prio++}"/>`;
           break;
         case 'scale': {
-          const cols = rule.colors ?? ['#f8696b', '#63be7b'];
+          // Excel needs 2 or 3 colours with a matching number of cfvo points
+          const valid = (rule.colors ?? []).map(hex6).filter((c): c is string => !!c);
+          const cols = valid.length < 2 ? ['FFF8696B', 'FF63BE7B'] : valid.length > 3 ? [valid[0], valid[valid.length >> 1], valid[valid.length - 1]] : valid;
           const kinds = cols.length === 3 ? ['<cfvo type="min"/>', '<cfvo type="percentile" val="50"/>', '<cfvo type="max"/>'] : ['<cfvo type="min"/>', '<cfvo type="max"/>'];
-          body = `<cfRule type="colorScale" priority="${prio++}"><colorScale>${kinds.join('')}${cols.map((c) => `<color rgb="${hex6(c)}"/>`).join('')}</colorScale></cfRule>`;
+          body = `<cfRule type="colorScale" priority="${prio++}"><colorScale>${kinds.join('')}${cols.map((c) => `<color rgb="${c}"/>`).join('')}</colorScale></cfRule>`;
           break;
         }
         case 'bar':
-          body = `<cfRule type="dataBar" priority="${prio++}"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="${hex6(rule.barColor ?? '#638ec6')}"/></dataBar></cfRule>`;
+          body = `<cfRule type="dataBar" priority="${prio++}"><dataBar><cfvo type="min"/><cfvo type="max"/><color rgb="${hex6(rule.barColor) ?? 'FF638EC6'}"/></dataBar></cfRule>`;
           break;
         default:
           break;
       }
       if (body) x += `<conditionalFormatting sqref="${sq}">${body}</conditionalFormatting>`;
     }
+    const extra = sheetExtras(sheet, sheetIdx + 1, vmlBlock);
+    vmlBlock += extra.blocks;
+    extras.push(extra);
+    x += extra.beforeMargins;
     x += '<pageMargins left="0.7" right="0.7" top="0.75" bottom="0.75" header="0.3" footer="0.3"/>';
+    x += extra.afterMargins;
     x += '</worksheet>';
     sheetXmls.push(x);
   });
@@ -659,7 +915,16 @@ export function writeXlsx(wb: Workbook): Uint8Array {
     wbx += `<sheet name="${esc(s.name)}" sheetId="${i + 1}" r:id="rId${i + 1}"/>`;
   });
   wbx += '</sheets>';
-  if (wb.names.size) wbx += '<definedNames>' + Array.from(wb.names.values()).map((n) => `<definedName name="${esc(n.name)}">${escText(addXlfn(n.refers))}</definedName>`).join('') + '</definedNames>';
+  if (wb.names.size) {
+    wbx += '<definedNames>';
+    for (const n of wb.names.values()) {
+      const local = n.scope === undefined ? -1 : wb.sheets.findIndex((s) => s.id === n.scope);
+      if (n.scope !== undefined && local < 0) continue;
+      const scopeAttr = local >= 0 ? ` localSheetId="${local}"` : '';
+      wbx += `<definedName name="${esc(renamedNames.get(n.name.toLowerCase()) ?? n.name)}"${scopeAttr}>${escText(addXlfn(n.refers, renamedNames))}</definedName>`;
+    }
+    wbx += '</definedNames>';
+  }
   wbx += '<calcPr calcId="191029" fullCalcOnLoad="1"/></workbook>';
 
   const n = wb.sheets.length;
@@ -668,8 +933,13 @@ export function writeXlsx(wb: Workbook): Uint8Array {
   rels += `<Relationship Id="rId${n + 1}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/>`;
   rels += `<Relationship Id="rId${n + 2}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" Target="sharedStrings.xml"/></Relationships>`;
 
-  let ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>';
-  for (let i = 0; i < n; i++) ct += `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
+  let ct = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/>';
+  if (extras.some((e) => e.vmlXml)) ct += '<Default Extension="vml" ContentType="application/vnd.openxmlformats-officedocument.vmlDrawing"/>';
+  ct += '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>';
+  for (let i = 0; i < n; i++) {
+    ct += `<Override PartName="/xl/worksheets/sheet${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`;
+    if (extras[i].commentsXml) ct += `<Override PartName="/xl/comments${i + 1}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.comments+xml"/>`;
+  }
   ct += '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/sharedStrings.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/></Types>';
 
   const files: Record<string, Uint8Array> = {
@@ -681,6 +951,11 @@ export function writeXlsx(wb: Workbook): Uint8Array {
     'xl/sharedStrings.xml': strToU8(sstXml),
   };
   sheetXmls.forEach((x, i) => (files[`xl/worksheets/sheet${i + 1}.xml`] = strToU8(x)));
+  extras.forEach((e, i) => {
+    if (e.rels) files[`xl/worksheets/_rels/sheet${i + 1}.xml.rels`] = strToU8(e.rels);
+    if (e.commentsXml) files[`xl/comments${i + 1}.xml`] = strToU8(e.commentsXml);
+    if (e.vmlXml) files[`xl/drawings/vmlDrawing${i + 1}.vml`] = strToU8(e.vmlXml);
+  });
   return zipSync(files, { level: 6 });
 }
 

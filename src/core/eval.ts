@@ -16,10 +16,11 @@ export interface SheetLike {
 export interface NameDef {
   name: string;
   refers: string; // formula text, no "="
+  scope?: number; // sheet id for a sheet-scoped name; undefined = workbook scope
 }
 export interface WbLike {
   sheetByName(name: string): SheetLike | undefined;
-  getName(name: string): NameDef | undefined;
+  getName(name: string, sheet?: { id: number }): NameDef | undefined;
   nameAst(def: NameDef): Node | null;
 }
 
@@ -327,7 +328,7 @@ export function evalNode(n: Node, ctx: Ctx, depth = 0): Arg {
       };
     }
     case 'name': {
-      const def = ctx.wb.getName(n.name);
+      const def = ctx.wb.getName(n.name, ctx.sheet);
       if (!def) return E.NAME;
       const ast = ctx.wb.nameAst(def);
       if (!ast) return E.NAME;

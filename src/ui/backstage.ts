@@ -153,6 +153,7 @@ export class Backstage {
       case 'options': {
         main.append(
           h('h1', {}, 'Options'),
+          this.card('palette', 'Appearance', 'Themes, colors, gradients, textures and animated backgrounds.', () => { this.hide(); a.studio.show(); }),
           this.card(a.dark ? 'sun' : 'moon', a.dark ? 'Switch to the light theme' : 'Switch to the dark theme', 'Change the color scheme of Sheetly.', () => { a.run('theme'); this.render(); }),
           this.card('info', 'About Sheetly', 'Version and license information.', () => { this.hide(); void a.run('about'); }),
         );

@@ -20,17 +20,22 @@ export interface Theme {
   accent: string;
   selFill: string;
   freeze: string;
+  /** Opaque version of bg. */
+  solid: string;
+  filterBg: string;
+  filterLine: string;
+  corner: string;
+  /** Show the stored "automatic" black border in the text colour on unfilled cells. */
+  lightAuto: boolean;
+  /** The sheet is see-through, so the canvas must keep its alpha channel. */
+  transparent: boolean;
 }
 
 export const LIGHT: Theme = {
   bg: '#ffffff', grid: '#d4d4d4', hdrBg: '#f5f5f5', hdrText: '#444444', hdrLine: '#c8c8c8',
   hdrSelBg: '#d3f0e0', hdrSelText: '#0e5c2f', hdrAllSelBg: '#a8d7bc', text: '#000000', accent: '#217346',
-  selFill: 'rgba(33,115,70,0.13)', freeze: '#8c8c8c',
-};
-export const DARK: Theme = {
-  bg: '#1f1f1f', grid: '#3a3a3a', hdrBg: '#2b2b2b', hdrText: '#c8c8c8', hdrLine: '#454545',
-  hdrSelBg: '#27493a', hdrSelText: '#a6e3bf', hdrAllSelBg: '#2f6b4b', text: '#e8e8e8', accent: '#3fb57a',
-  selFill: 'rgba(63,181,122,0.18)', freeze: '#7a7a7a',
+  selFill: 'rgba(33,115,70,0.13)', freeze: '#8c8c8c', solid: '#ffffff', filterBg: '#f0f0f0', filterLine: '#a0a0a0', corner: '#b4b4b4',
+  lightAuto: false, transparent: false,
 };
 
 export interface GridHost {
@@ -135,7 +140,7 @@ export class Grid {
     this.bind();
     const ro = new ResizeObserver(() => this.resize());
     ro.observe(this.area);
-    this.resize();
+    this.resize(false); // the app is still being set up, so the first paint waits for the next frame
   }
 
   // ------------------------------------------------------------------ geometry
@@ -505,7 +510,7 @@ export class Grid {
   }
 
   // ------------------------------------------------------------------ resize & render
-  resize(): void {
+  resize(paint = true): void {
     const r = this.area.getBoundingClientRect();
     this.dpr = window.devicePixelRatio || 1;
     this.W = Math.max(1, Math.floor(r.width));
@@ -515,7 +520,12 @@ export class Grid {
     this.canvas.style.width = this.W + 'px';
     this.canvas.style.height = this.H + 'px';
     this.clampScroll();
-    this.invalidate();
+    // Setting the canvas size wipes it. Repaint now, before the browser shows the frame, or it flashes black.
+    if (paint) {
+      if (this.raf) cancelAnimationFrame(this.raf);
+      this.raf = 0;
+      this.render();
+    } else this.invalidate();
     this.host.viewChanged();
   }
 
@@ -558,10 +568,27 @@ export class Grid {
     return { frozen, scroll };
   }
 
+  /** An opaque canvas keeps text crisp, so the alpha channel is only used while the sheet is see-through. */
+  setTheme(t: Theme): void {
+    const swap = t.transparent !== this.theme.transparent;
+    this.theme = t;
+    if (swap) {
+      const next = document.createElement('canvas');
+      next.className = 'grid-canvas';
+      this.canvas.replaceWith(next);
+      this.canvas = next;
+      this.ctx = next.getContext('2d', { alpha: t.transparent })!;
+      this.textCache.clear();
+      this.resize();
+    }
+    this.invalidate();
+  }
+
   render(): void {
     const ctx = this.ctx;
     const t = this.theme;
     ctx.setTransform(this.dpr, 0, 0, this.dpr, 0, 0);
+    if (t.transparent) ctx.clearRect(0, 0, this.W, this.H);
     ctx.fillStyle = t.bg;
     ctx.fillRect(0, 0, this.W, this.H);
     this.ensureMergeMap();
@@ -637,7 +664,9 @@ export class Grid {
     const hasCF = s.cf.length > 0;
     const editing = this.editor.active ? this.editor : null;
     const painted: { r: number; c: number; x: number; y: number; w: number; h: number; cell: Cell; cfc?: string; cf?: { bold?: boolean; italic?: boolean } }[] = [];
-    // pass 1: fills, bars and borders
+    // Borders are drawn after every fill: a fill overlaps its neighbours by 1px and would erase their lines.
+    const bordered: { st: import('../core/model').CellStyle; x: number; y: number; w: number; h: number; filled: boolean }[] = [];
+    // pass 1: fills and bars
     for (const row of rows) {
       for (const col of cols) {
         const key = cellKey(row.i, col.i);
@@ -657,7 +686,7 @@ export class Grid {
           ctx.fillRect(col.p + 2, row.p + 2, Math.max(1, (col.s - 4) * cf.bar.pct), row.s - 4);
           ctx.globalAlpha = 1;
         }
-        if (st.bl || st.br || st.bt || st.bb) this.drawBorders(st, col.p, row.p, col.s, row.s);
+        if (st.bl || st.br || st.bt || st.bb) bordered.push({ st, x: col.p, y: row.p, w: col.s, h: row.s, filled: !!fill });
         if (cell && (cell.v !== null || cell.f !== undefined)) painted.push({ r: row.i, c: col.i, x: col.p, y: row.p, w: col.s, h: row.s, cell, cfc: cf?.color, cf: cf ?? undefined });
       }
     }
@@ -669,6 +698,8 @@ export class Grid {
       const st = wb.styleOf(cell?.s);
       const cf = hasCF ? this.host.cf.evaluate(s, m.r1, m.c1) : null;
       const fill = cf?.fill ?? st.fill;
+      // On a see-through sheet, wipe the gridlines first or they would show through the merged area.
+      if (!fill && t.transparent) ctx.clearRect(r.x, r.y, r.w + 1, r.h + 1);
       ctx.fillStyle = fill ?? t.bg;
       ctx.fillRect(r.x, r.y, r.w + 1, r.h + 1);
       if (this.host.gridlines && !fill) {
@@ -678,10 +709,11 @@ export class Grid {
       const stB = wb.styleOf(s.cells.get(cellKey(m.r2, m.c1))?.s);
       const stR = wb.styleOf(s.cells.get(cellKey(m.r1, m.c2))?.s);
       const stBR = wb.styleOf(s.cells.get(cellKey(m.r2, m.c2))?.s);
-      const bst = { ...st, bb: stB.bb ?? stBR.bb ?? st.bb, br: stR.br ?? stBR.br ?? st.br };
-      if (bst.bl || bst.br || bst.bt || bst.bb) this.drawBorders(bst, r.x, r.y, r.w, r.h);
+      const bst = { ...st, bt: st.bt ?? stR.bt, bl: st.bl ?? stB.bl, bb: stB.bb ?? stBR.bb ?? st.bb, br: stR.br ?? stBR.br ?? st.br };
+      if (bst.bl || bst.br || bst.bt || bst.bb) bordered.push({ st: bst, x: r.x, y: r.y, w: r.w, h: r.h, filled: !!fill });
       if (cell && (cell.v !== null || cell.f !== undefined)) painted.push({ r: m.r1, c: m.c1, x: r.x, y: r.y, w: r.w, h: r.h, cell, cfc: cf?.color, cf: cf ?? undefined });
     }
+    for (const b of bordered) this.drawBorders(b.st, b.x, b.y, b.w, b.h, b.filled);
     // pass 2: text
     for (const p of painted) {
       if (editing && editing.r === p.r && editing.c === p.c) continue;
@@ -707,9 +739,9 @@ export class Grid {
     const sz = 16 * z;
     const x = right - sz - 1;
     const y = bottom - sz - 1;
-    ctx.fillStyle = this.theme === DARK ? '#3a3a3a' : '#f0f0f0';
+    ctx.fillStyle = this.theme.filterBg;
     ctx.fillRect(x, y, sz, sz);
-    ctx.strokeStyle = this.theme === DARK ? '#6a6a6a' : '#a0a0a0';
+    ctx.strokeStyle = this.theme.filterLine;
     ctx.lineWidth = 1;
     ctx.strokeRect(x + 0.5, y + 0.5, sz - 1, sz - 1);
     ctx.fillStyle = active ? this.theme.accent : this.theme.text;
@@ -721,11 +753,13 @@ export class Grid {
     ctx.fill();
   }
 
-  private drawBorders(st: import('../core/model').CellStyle, x: number, y: number, w: number, h: number): void {
+  private drawBorders(st: import('../core/model').CellStyle, x: number, y: number, w: number, h: number, filled: boolean): void {
     const ctx = this.ctx;
     const side = (b: import('../core/model').Border | undefined, x1: number, y1: number, x2: number, y2: number, horiz: boolean) => {
       if (!b) return;
-      ctx.strokeStyle = b.color || this.theme.text;
+      // Black is the stored "automatic" colour: keep it readable on a dark theme's unfilled background.
+      const auto = !b.color || (this.theme.lightAuto && !filled && b.color.toLowerCase() === '#000000');
+      ctx.strokeStyle = auto ? this.theme.text : b.color;
       ctx.setLineDash([]);
       let lw = 1;
       if (b.style === 'medium') lw = 2;
@@ -968,13 +1002,14 @@ export class Grid {
       const isSingle = !multi || (hasActive && a.r1 === rg.r1 && a.r2 === rg.r2 && a.c1 === rg.c1 && a.c2 === rg.c2);
       if (!isSingle) {
         ctx.fillStyle = t.selFill;
+        ctx.fillRect(p.x, p.y, p.w, p.h);
         if (hasActive) {
+          // The active cell is tinted like the rest of the range; a thin outline still marks it.
           const ap = this.rectPx(a);
-          ctx.beginPath();
-          ctx.rect(p.x, p.y, p.w, p.h);
-          ctx.rect(ap.x, ap.y, ap.w, ap.h);
-          ctx.fill('evenodd');
-        } else ctx.fillRect(p.x, p.y, p.w, p.h);
+          ctx.strokeStyle = t.accent;
+          ctx.lineWidth = 1;
+          ctx.strokeRect(ap.x + 1.5, ap.y + 1.5, ap.w - 3, ap.h - 3);
+        }
       }
       if (this.editor.active && this.editor.mode === 'point') return;
       ctx.strokeStyle = t.accent;
@@ -990,7 +1025,7 @@ export class Grid {
       const p = this.rectPx(last);
       const hx = p.x + p.w - 4;
       const hy = p.y + p.h - 4;
-      ctx.fillStyle = t.bg;
+      ctx.fillStyle = t.solid;
       ctx.fillRect(hx - 1, hy - 1, 8, 8);
       ctx.fillStyle = t.accent;
       ctx.fillRect(hx, hy, 6, 6);
@@ -1032,6 +1067,7 @@ export class Grid {
       ctx.beginPath();
       ctx.rect(cx, 0, cw, hh);
       ctx.clip();
+      if (t.transparent) ctx.clearRect(cx, 0, cw, hh);
       ctx.fillStyle = t.hdrBg;
       ctx.fillRect(cx, 0, cw, hh);
       for (const s of segs) {
@@ -1065,6 +1101,7 @@ export class Grid {
       ctx.beginPath();
       ctx.rect(0, cy, hw, ch);
       ctx.clip();
+      if (t.transparent) ctx.clearRect(0, cy, hw, ch);
       ctx.fillStyle = t.hdrBg;
       ctx.fillRect(0, cy, hw, ch);
       for (const s of segs) {
@@ -1089,9 +1126,10 @@ export class Grid {
       ctx.restore();
     }
     // corner
+    if (t.transparent) ctx.clearRect(0, 0, hw, hh);
     ctx.fillStyle = t.hdrBg;
     ctx.fillRect(0, 0, hw, hh);
-    ctx.fillStyle = this.theme === DARK ? '#5a5a5a' : '#b4b4b4';
+    ctx.fillStyle = t.corner;
     ctx.beginPath();
     ctx.moveTo(hw - 4, hh - 14 * z);
     ctx.lineTo(hw - 4, hh - 4);

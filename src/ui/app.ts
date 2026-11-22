@@ -1,10 +1,10 @@
 // Application controller: document state, commands, formula bar, sheet tabs, status bar, files.
-import { MAX_COLS, MAX_ROWS, Rect, a1, keyCol, keyRow, normRect, parseRect, rectText, colName, parseCell } from '../core/addr';
+import { MAX_COLS, MAX_ROWS, Rect, a1, keyCol, keyRow, normRect, parseRect, rectText, colName } from '../core/addr';
 import { CFEngine } from '../core/cf';
 import { readCSV, writeCSV } from '../core/csv';
 import { FUNCS } from '../core/eval';
 import { editText } from '../core/input';
-import { Border, Cell, CFRule, Sheet, StylePatch, Workbook } from '../core/model';
+import { Border, Cell, CFRule, Sheet, StylePatch, Workbook, isValidDefinedName } from '../core/model';
 import { changeDecimals, FMT_ACCOUNTING, FMT_CURRENCY, FMT_PERCENT } from '../core/numfmt';
 import {
   ClipData, FormulaError, PasteMode, SortKey, applyFilter, applyInput, applyStyle, clearFilter, clearRange, copyRange, currentRegion, deleteCols, deleteRows,
@@ -13,7 +13,10 @@ import {
 import { fromJSON, toJSON } from '../core/serialize';
 import { readXlsx, writeXlsx } from '../core/xlsx';
 import { FErr, todaySerial, nowSerial } from '../core/values';
-import { Grid, GridHost, DARK, LIGHT } from './grid';
+import { Grid, GridHost } from './grid';
+import { Look, applyCss, clone, gridTheme, isDark, loadImage, loadLook, mix, palette, preset, saveLook } from './theme';
+import { Wallpaper } from './wallpaper';
+import { Studio } from './studio';
 import { appMark, icon } from './icons';
 import { h, messageBox, openDialog, promptBox, showMenu, showMenuBelow, showColorMenu, MenuItem, toast, closeMenus } from './dom';
 import * as fs from './fsapi';
@@ -72,6 +75,11 @@ export class App implements GridHost {
   grid!: Grid;
   ribbon!: Ribbon;
   backstage!: Backstage;
+  studio!: Studio;
+  wallpaper!: Wallpaper;
+  look!: Look;
+  private lookSaveTimer = 0;
+  private otherMode: Partial<Record<'light' | 'dark', Look>> = {}; // restored when flipping light/dark back
   findState = { what: '', replace: '', matchCase: false, wholeCell: false, inFormulas: false, allSheets: false, byRows: true };
   private statusMsg = '';
   private refreshQueued = false;
@@ -100,13 +108,18 @@ export class App implements GridHost {
 
   constructor() {
     this.wb.onChange = () => this.onWorkbookChange();
-    const dark = localStorage.getItem('sheetly.theme') === 'dark';
-    this.setTheme(dark, false);
+    this.wallpaper = new Wallpaper();
+    this.look = loadLook();
+    this.dark = isDark(this.look);
+    applyCss(this.look);
     const area = document.getElementById('grid-area')!;
     this.grid = new Grid(this, area, document.getElementById('vscroll')!, document.getElementById('hscroll')!, this.wb.sheets[0]);
+    this.grid.setTheme(gridTheme(this.look));
+    this.wallpaper.apply(this.look, loadImage());
     this.grid.editor.attachBar(this.el.fbTa, this.el.fbMirror);
     this.ribbon = new Ribbon(this);
     this.backstage = new Backstage(this);
+    this.studio = new Studio(this);
     this.bindChrome();
     this.renderTabs();
     this.refreshAll();
@@ -713,21 +726,42 @@ export class App implements GridHost {
   }
 
   // ------------------------------------------------------------------ theme & zoom UI
-  setTheme(dark: boolean, redraw = true): void {
-    this.dark = dark;
-    document.documentElement.dataset.theme = dark ? 'dark' : 'light';
-    if (this.grid) {
-      this.grid.theme = dark ? DARK : LIGHT;
+  /** Light/dark switch: keeps the wallpaper and accent, and remembers the look it leaves so flipping back restores it. */
+  setTheme(dark: boolean): void {
+    if (dark === this.dark) return;
+    const cur = this.look;
+    this.otherMode[this.dark ? 'dark' : 'light'] = clone(cur);
+    let next = this.otherMode[dark ? 'dark' : 'light'];
+    if (!next) {
+      if (cur.id === 'classic' || cur.id === 'dark') next = preset(dark ? 'dark' : 'classic');
+      else {
+        next = clone(cur);
+        next.id = 'custom';
+        next.name = 'Custom';
+        next.c = palette(cur.c.accent, dark, 0.09);
+        next.barGrad.to = cur.barGrad.on ? cur.barGrad.to : mix(next.c.bar, '#000000', 0.25);
+        next.ribbonGrad.to = mix(next.c.ribbon, cur.c.accent, 0.12);
+      }
     }
-    try {
-      localStorage.setItem('sheetly.theme', dark ? 'dark' : 'light');
-    } catch {
-      /* ignore */
-    }
-    if (redraw) {
-      this.grid.invalidate();
-      this.ribbon.update();
-    }
+    this.setLook(next);
+    this.studio.refresh();
+  }
+
+  /** Applies a look to the whole app at once and saves it shortly after. */
+  setLook(l: Look): void {
+    this.look = l;
+    this.dark = isDark(l);
+    applyCss(l);
+    this.grid.setTheme(gridTheme(l));
+    this.wallpaper.apply(l, l.wall.mode === 'image' ? loadImage() : null);
+    this.ribbon.update();
+    clearTimeout(this.lookSaveTimer);
+    this.lookSaveTimer = window.setTimeout(() => saveLook(this.look), 250);
+  }
+
+  /** A new picture was stored under the same look. */
+  applyLookImage(): void {
+    this.wallpaper.apply(this.look, loadImage());
   }
 
   private initStatusZoom(): void {
@@ -827,7 +861,7 @@ export class App implements GridHost {
         const err = this.validateSheetName(input.value, s);
         if (err) {
           await messageBox('Sheetly', err);
-        } else renameSheet(this.wb, s, input.value);
+        } else if (input.value.trim() !== s.name) renameSheet(this.wb, s, input.value.trim());
       }
       this.renderTabs();
       this.grid.focusGrid();
@@ -845,6 +879,7 @@ export class App implements GridHost {
     if (!n) return 'The sheet name cannot be blank.';
     if (n.length > 31) return 'The sheet name must be 31 characters or fewer.';
     if (/[\\/?*[\]:]/.test(n)) return 'The sheet name cannot contain any of the following characters: \\ / ? * [ ] :';
+    if (n.startsWith("'") || n.endsWith("'")) return 'The sheet name cannot begin or end with an apostrophe.';
     if (this.wb.sheets.some((s) => s !== except && s.name.toLowerCase() === n.toLowerCase())) return 'That name is already in use. Try a different name.';
     return null;
   }
@@ -1279,6 +1314,7 @@ export class App implements GridHost {
         grid.resize();
         return;
       case 'theme': return this.setTheme(arg === undefined ? !this.dark : !!arg);
+      case 'appearance': return this.studio.toggle();
       case 'orientation':
         this.orientation = arg as 'portrait' | 'landscape';
         this.ribbon.update();
@@ -1409,7 +1445,8 @@ export class App implements GridHost {
     const sheet = this.sheet;
     const rects = this.grid.ranges.map((r) => this.grid.expandForMerges(r));
     if (this.tooLarge(rects, 500_000, 'Borders')) return;
-    const thin: Border = { style: 'thin', color: this.dark ? '#ffffff' : '#000000' };
+    // Always store black: the grid shows it light on the dark theme, and saved files stay readable elsewhere.
+    const thin: Border = { style: 'thin', color: '#000000' };
     const med: Border = { style: 'medium', color: thin.color };
     const thick: Border = { style: 'thick', color: thin.color };
     const dbl: Border = { style: 'double', color: thin.color };
@@ -1621,7 +1658,7 @@ export class App implements GridHost {
       this.selectRectKeepActive(rect);
       return;
     }
-    const def = this.wb.getName(t);
+    const def = this.wb.getName(t, this.sheet);
     if (def) {
       const m = /^(?:'?([^'!]+)'?!)?(.+)$/.exec(def.refers);
       if (m) {
@@ -1635,7 +1672,7 @@ export class App implements GridHost {
       }
     }
     // define a new name for the current selection
-    if (/^[A-Za-z_][A-Za-z0-9_.]*$/.test(t) && !parseCell(t)) {
+    if (isValidDefinedName(t)) {
       const rg = this.grid.range;
       const q = /^[A-Za-z_][\w.]*$/.test(this.sheet.name) ? this.sheet.name : "'" + this.sheet.name.replace(/'/g, "''") + "'";
       this.wb.transact('Define name', () => this.wb.setName(t, `${q}!${rectAbs(rg)}`), true);

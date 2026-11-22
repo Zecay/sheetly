@@ -766,6 +766,7 @@ export class Ribbon {
         }),
       ]),
       this.group('Theme', [
+        this.large({ icon: 'palette', label: 'Appearance', tip: ['Appearance', 'Change themes, colors, textures and animated backgrounds.'], cmd: () => a.run('appearance'), on: () => a.studio?.isOpen }),
         this.large({ icon: 'moon', label: 'Dark Mode', tip: ['Dark Mode', 'Switch between the light and dark color schemes.'], cmd: () => a.run('theme'), on: () => a.dark }),
       ]),
     ];

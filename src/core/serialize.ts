@@ -1,6 +1,7 @@
 // Native Sheetly format (.sheetly, JSON) — also used for autosave recovery.
 import { Rect, cellKey, keyCol, keyRow } from './addr';
-import { CFRule, CellStyle, Workbook } from './model';
+import { CFRule, CellComment, CellStyle, DataValidation, Hyperlink, Workbook } from './model';
+import { normalizeSheetNames } from './ops';
 import { E, FErr, Value, errFromCode } from './values';
 
 type JV = number | string | boolean | null | { e: string };
@@ -14,8 +15,12 @@ interface SheetJSON {
   cols: [number, number][];
   rows: [number, number][];
   defRow: number;
+  defCol?: number;
   merges: Rect[];
   cf: CFRule[];
+  links?: Hyperlink[];
+  notes?: CellComment[];
+  checks?: DataValidation[];
   freeze: [number, number];
   tab?: string;
   grid: boolean;
@@ -26,7 +31,7 @@ interface BookJSON {
   v: 1;
   styles: CellStyle[];
   sheets: SheetJSON[];
-  names: [string, string][];
+  names: [string, string, number?][]; // third item: index of the owning sheet
   active: number;
 }
 
@@ -34,7 +39,10 @@ export function toJSON(wb: Workbook, active = 0): string {
   const book: BookJSON = {
     v: 1,
     styles: wb.styles,
-    names: Array.from(wb.names.values()).map((n) => [n.name, n.refers]),
+    names: Array.from(wb.names.values()).map((n): [string, string, number?] => {
+      const at = n.scope === undefined ? -1 : wb.sheets.findIndex((s) => s.id === n.scope);
+      return at < 0 ? [n.name, n.refers] : [n.name, n.refers, at];
+    }),
     active,
     sheets: wb.sheets.map((s) => {
       const cells: SheetJSON['cells'] = [];
@@ -45,8 +53,12 @@ export function toJSON(wb: Workbook, active = 0): string {
         cols: Array.from(s.cols.sizes),
         rows: Array.from(s.rows.sizes),
         defRow: s.rows.def,
+        defCol: s.cols.def,
         merges: s.merges,
         cf: s.cf,
+        links: s.hyperlinks.length ? s.hyperlinks : undefined,
+        notes: s.comments.length ? s.comments : undefined,
+        checks: s.validations.length ? s.validations : undefined,
         freeze: [s.freezeRows, s.freezeCols] as [number, number],
         tab: s.tabColor,
         grid: s.showGrid,
@@ -74,11 +86,15 @@ export function fromJSON(text: string): { wb: Workbook; active: number } {
       if (typeof f === "string") cell.f = f;
       s.cells.set(cellKey(r, c), cell);
     }
+    s.cols.def = sj.defCol || 64;
     for (const [i, w] of sj.cols) s.cols.set(i, w);
     s.rows.def = sj.defRow || 20;
     for (const [i, h] of sj.rows) s.rows.set(i, h);
     s.merges = sj.merges;
     s.cf = sj.cf.map((r) => ({ ...r, id: wb.nextRuleId++ }));
+    s.hyperlinks = sj.links ?? [];
+    s.comments = sj.notes ?? [];
+    s.validations = sj.checks ?? [];
     s.freezeRows = sj.freeze[0];
     s.freezeCols = sj.freeze[1];
     s.tabColor = sj.tab;
@@ -88,7 +104,8 @@ export function fromJSON(text: string): { wb: Workbook; active: number } {
     s.recomputeBounds();
   }
   if (!wb.sheets.length) wb.addSheet('Sheet1');
-  for (const [n, r] of book.names) wb.setName(n, r);
+  for (const [n, r, at] of book.names) wb.setName(n, r, at === undefined ? undefined : wb.sheets[at]?.id);
+  normalizeSheetNames(wb);
   wb.rebuildDeps();
   wb.recalcAll();
   wb.clearHistory();

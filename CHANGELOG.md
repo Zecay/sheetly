@@ -3,6 +3,26 @@
 All notable changes to Sheetly are listed here, newest first.
 Sheetly is in early **alpha**: expect bugs, and please report them in the GitHub issues.
 
+## 0.2.0-alpha
+
+Added:
+
+- Appearance panel (File > Options > Appearance, or View > Appearance) that changes the real app live.
+- 28 pre-built themes, one-click themes from a single color, "Surprise me", and your own saved themes.
+- Full color control over the top bar, ribbon, sheet, headers, gridlines, selection, menus and text, with gradients.
+- Wallpapers (gradient or your own picture), 12 textures, and adjustable see-through sheet and toolbars.
+- 10 animated backgrounds including Black Hole, Aurora and Retro Sun, with speed, amount and performance settings. They pause when Sheetly is minimized or not focused.
+- Interface font, text size, rounded corners, and optional menu and dialog animations.
+
+Fixed:
+
+- The first cell of a multi-cell selection is now highlighted with the rest, with a thin outline marking the active cell.
+- The sheet no longer flashes black when it is resized, such as when opening the Appearance panel.
+- Borders on merged cells no longer disappear: fills are painted first, so a neighbouring cell or merge cannot erase them. Borders added in dark mode are now stored as black and shown light on the dark background, so they stay visible on coloured fills and in other apps.
+- Saved `.xlsx` files avoid more causes of Excel's repair prompt: invalid or too-long sheet names, overlapping merges, invalid names, unsupported error codes, bad colour scales, and values over Excel's row height, column width and cell text limits.
+- Opening `.xlsx` files: 1904-date workbooks, ISO date cells, sheet-scoped names and default column widths are now read correctly.
+- Hyperlinks, comments and data validation from opened `.xlsx` files are now kept when saving. Sheetly does not show or edit them yet.
+
 ## 0.1.0-alpha (first public release)
 
 First public version.

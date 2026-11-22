@@ -100,6 +100,7 @@ const defs: Record<string, string> = {
   paintbrush: P('M14 4l6 6-8 8H6v-6z') + P('M4 20h4'),
   trash: P('M5 7h14M9 7V4h6v3M7 7l1 13h8l1-13'),
   window: R(4, 5, 16, 14) + P('M4 9h16'),
+  palette: P('M12 3a9 9 0 100 18c1.4 0 2-.9 2-1.8 0-1.3-1-1.7-1-2.7 0-.9.7-1.5 1.7-1.5H17a4 4 0 004-4c0-4.4-4-8-9-8z') + P('M7.5 11.5h.01M10 7.5h.01M15 7.5h.01', 'a'),
 };
 
 export function icon(name: string, size = 16): string {

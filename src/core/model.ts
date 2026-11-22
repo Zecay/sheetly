@@ -1,5 +1,5 @@
 // Workbook model: sheets, sparse cells, styles, undo history and the recalculation engine.
-import { MAX_COLS, MAX_ROWS, Rect, cellKey, keyCol, keyRow } from './addr';
+import { MAX_COLS, MAX_ROWS, Rect, cellKey, colIndex, keyCol, keyRow } from './addr';
 import { Ctx, DepRef, NameDef, SheetLike, WbLike, collectRefs, evaluate } from './eval';
 import { FErr, E, Value } from './values';
 import { Node, ParseError, parseFormula } from './parser';
@@ -68,6 +68,55 @@ export interface CFRule {
 export interface AutoFilter {
   rect: Rect; // header row is rect.r1
   cols: Map<number, Set<string>>; // allowed display strings per column
+}
+
+/** Kept from opened .xlsx files and written back; Sheetly has no editor for these yet. */
+export interface Hyperlink {
+  rect: Rect;
+  target?: string; // external URL
+  location?: string; // place inside the workbook
+  display?: string;
+  tooltip?: string;
+}
+export interface CellComment {
+  r: number;
+  c: number;
+  author: string;
+  text: string;
+}
+export interface DataValidation {
+  rects: Rect[];
+  attrs: Record<string, string>;
+  f1?: string;
+  f2?: string;
+}
+
+// ---------------- Excel name rules ----------------
+
+export const MAX_SHEET_NAME = 31;
+
+/** Cut to at most max UTF-16 units without splitting a surrogate pair. */
+export function clipText(s: string, max: number): string {
+  if (s.length <= max) return s;
+  const c = s.charCodeAt(max - 1);
+  return s.slice(0, c >= 0xd800 && c <= 0xdbff ? max - 1 : max);
+}
+
+/** Make a sheet name legal for Excel: 31 chars, no \ / ? * [ ] :, no apostrophe at either end. */
+export function cleanSheetName(raw: string): string {
+  // eslint-disable-next-line no-control-regex
+  const strip = (s: string) => s.trim().replace(/^'+|'+$/g, '').trim();
+  const n = strip(clipText(strip(raw.replace(/[\\/?*[\]:\x00-\x1f]/g, '_')), MAX_SHEET_NAME));
+  return n || 'Sheet';
+}
+
+/** True when Excel accepts this as a defined name. */
+export function isValidDefinedName(name: string): boolean {
+  if (!name || name.length > 255) return false;
+  if (!/^[\p{L}_\\][\p{L}\p{N}_.\\?]*$/u.test(name)) return false;
+  const cell = /^([A-Za-z]{1,3})([1-9]\d*)$/.exec(name);
+  if (cell && parseInt(cell[2], 10) <= MAX_ROWS && colIndex(cell[1]) < MAX_COLS) return false;
+  return !/^(?:[Rr]\d*(?:[Cc]\d*)?|[Cc]\d*)$/.test(name); // R, C, R1, C1, R1C1
 }
 
 export class Axis {
@@ -142,6 +191,9 @@ export class Sheet implements SheetLike {
   rows = new Axis(20);
   merges: Rect[] = [];
   cf: CFRule[] = [];
+  hyperlinks: Hyperlink[] = [];
+  comments: CellComment[] = [];
+  validations: DataValidation[] = [];
   freezeRows = 0;
   freezeCols = 0;
   tabColor?: string;
@@ -207,6 +259,9 @@ interface SheetSnap {
   rows: Map<number, number>;
   merges: Rect[];
   cf: CFRule[];
+  hyperlinks: Hyperlink[];
+  comments: CellComment[];
+  validations: DataValidation[];
   freezeRows: number;
   freezeCols: number;
   tabColor?: string;
@@ -288,15 +343,20 @@ export class Workbook implements WbLike {
     return s;
   }
   uniqueSheetName(base: string, except?: Sheet): string {
-    let name = base;
+    let name = clipText(base, MAX_SHEET_NAME);
     let i = 2;
-    while (this.sheets.some((s) => s !== except && s.name.toLowerCase() === name.toLowerCase())) name = base + ' (' + i++ + ')';
+    while (this.sheets.some((s) => s !== except && s.name.toLowerCase() === name.toLowerCase())) {
+      const suffix = ' (' + i++ + ')';
+      name = clipText(base, MAX_SHEET_NAME - suffix.length).trimEnd() + suffix;
+    }
     return name;
   }
 
   // ---------- names ----------
-  getName(name: string): NameDef | undefined {
-    return this.names.get(name.toLowerCase());
+  /** Look up a name. With a sheet, that sheet's own name wins over a workbook-level one. */
+  getName(name: string, sheet?: { id: number }): NameDef | undefined {
+    const l = name.toLowerCase();
+    return (sheet && this.names.get(sheet.id + '!' + l)) || this.names.get(l);
   }
   nameAst(def: NameDef): Node | null {
     let a = this.nameAstCache.get(def.refers);
@@ -310,12 +370,15 @@ export class Workbook implements WbLike {
     }
     return a;
   }
-  setName(name: string, refers: string): void {
-    this.names.set(name.toLowerCase(), { name, refers });
+  setName(name: string, refers: string, scope?: number): void {
+    const l = name.toLowerCase();
+    if (scope === undefined) this.names.set(l, { name, refers });
+    else this.names.set(scope + '!' + l, { name, refers, scope });
     this.nameAstCache.clear();
   }
-  deleteName(name: string): void {
-    this.names.delete(name.toLowerCase());
+  deleteName(name: string, scope?: number): void {
+    const l = name.toLowerCase();
+    this.names.delete(scope === undefined ? l : scope + '!' + l);
   }
 
   // ---------- styles ----------
@@ -466,6 +529,9 @@ export class Workbook implements WbLike {
         rows: new Map(s.rows.sizes),
         merges: s.merges.map((m) => ({ ...m })),
         cf: s.cf.map((c) => ({ ...c, rect: { ...c.rect } })),
+        hyperlinks: s.hyperlinks.map((h) => ({ ...h, rect: { ...h.rect } })),
+        comments: s.comments.map((c) => ({ ...c })),
+        validations: s.validations.map((v) => ({ ...v, rects: v.rects.map((x) => ({ ...x })) })),
         freezeRows: s.freezeRows,
         freezeCols: s.freezeCols,
         tabColor: s.tabColor,
@@ -485,6 +551,9 @@ export class Workbook implements WbLike {
       s.rows.touch();
       s.merges = ss.merges.map((m) => ({ ...m }));
       s.cf = ss.cf.map((c) => ({ ...c, rect: { ...c.rect } }));
+      s.hyperlinks = ss.hyperlinks.map((h) => ({ ...h, rect: { ...h.rect } }));
+      s.comments = ss.comments.map((c) => ({ ...c }));
+      s.validations = ss.validations.map((v) => ({ ...v, rects: v.rects.map((x) => ({ ...x })) }));
       s.freezeRows = ss.freezeRows;
       s.freezeCols = ss.freezeCols;
       s.tabColor = ss.tabColor;
@@ -582,7 +651,7 @@ export class Workbook implements WbLike {
         const key = n.toLowerCase();
         if (seenNames.has(key) || depth > 8) continue;
         seenNames.add(key);
-        const def = this.names.get(key);
+        const def = this.getName(key, sheet);
         if (!def) continue;
         const ast = this.nameAst(def);
         if (!ast) continue;

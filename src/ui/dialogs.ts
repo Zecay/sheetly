@@ -1,7 +1,7 @@
 // Dialogs: Format Cells, Name Manager, Find & Replace, Sort, Conditional Formatting, filter panel and more.
 import { MAX_COLS, MAX_ROWS, Rect, a1, colName, parseRect, rectText } from '../core/addr';
 import { FUNCS } from '../core/eval';
-import { Border, CFRule, CellStyle, StylePatch } from '../core/model';
+import { Border, CFRule, CellStyle, StylePatch, isValidDefinedName } from '../core/model';
 import { formatValue } from '../core/numfmt';
 import {
   FindOpts, SortKey, applyFilter, applyStyle, cellMatches, currentRegion, deleteCols, deleteRows, displayText, filterValueText, findAll, insertCols, insertRows, replaceInCell,
@@ -454,12 +454,13 @@ export function openNameManager(app: App): void {
   const refInput = h('input', { type: 'text', class: 'txt', style: { width: '100%' } }) as HTMLInputElement;
   const render = () => {
     tbody.innerHTML = '';
-    const names = Array.from(wb.names.values()).sort((a, b) => a.name.localeCompare(b.name));
+    const names = Array.from(wb.names.entries()).sort((a, b) => a[1].name.localeCompare(b[1].name));
     if (!names.length) tbody.append(h('tr', {}, h('td', { colspan: '2', style: { color: 'var(--muted)' } }, 'No names defined yet.')));
-    for (const n of names) {
-      const tr = h('tr', { class: selected === n.name.toLowerCase() ? 'sel' : '' }, h('td', {}, n.name), h('td', {}, n.refers));
+    for (const [key, n] of names) {
+      const owner = n.scope === undefined ? '' : ` (${wb.sheetById(n.scope)?.name ?? '?'})`;
+      const tr = h('tr', { class: selected === key ? 'sel' : '' }, h('td', {}, n.name + owner), h('td', {}, n.refers));
       tr.addEventListener('click', () => {
-        selected = n.name.toLowerCase();
+        selected = key;
         refInput.value = n.refers;
         render();
       });
@@ -469,9 +470,9 @@ export function openNameManager(app: App): void {
   const table = h('div', { class: 'listbox', style: { height: '220px', width: '100%' } }, h('table', { class: 'table-list' }, h('thead', {}, h('tr', {}, h('th', {}, 'Name'), h('th', {}, 'Refers To'))), tbody));
   const apply = () => {
     if (!selected) return;
-    const def = wb.getName(selected);
+    const def = wb.names.get(selected);
     if (!def) return;
-    wb.transact('Edit name', () => wb.setName(def.name, refInput.value.replace(/^=/, '')), true);
+    wb.transact('Edit name', () => wb.setName(def.name, refInput.value.replace(/^=/, ''), def.scope), true);
     wb.rebuildDeps();
     wb.requestFullRecalc();
     render();
@@ -481,9 +482,9 @@ export function openNameManager(app: App): void {
   const btnDel = h('button', { class: 'btn', type: 'button' }, 'Delete');
   btnDel.addEventListener('click', () => {
     if (!selected) return;
-    const def = wb.getName(selected);
+    const def = wb.names.get(selected);
     if (!def) return;
-    wb.transact('Delete name', () => wb.deleteName(def.name), true);
+    wb.transact('Delete name', () => wb.deleteName(def.name, def.scope), true);
     wb.rebuildDeps();
     wb.requestFullRecalc();
     selected = null;
@@ -522,12 +523,8 @@ export function openDefineName(app: App, onDone?: () => void): void {
         primary: true,
         onClick: () => {
           const n = name.value.trim();
-          if (!/^[A-Za-z_\\][A-Za-z0-9_.]*$/.test(n)) {
-            err.textContent = "The name that you entered is not valid.";
-            return false;
-          }
-          if (/^[A-Za-z]{1,3}\d+$/.test(n) || /^[Rr]\d*[Cc]\d*$/.test(n)) {
-            err.textContent = 'The name cannot look like a cell reference.';
+          if (!isValidDefinedName(n)) {
+            err.textContent = 'The name is not valid. It must start with a letter or underscore and cannot look like a cell reference.';
             return false;
           }
           if (wb.getName(n)) {
