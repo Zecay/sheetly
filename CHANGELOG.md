@@ -1,7 +1,17 @@
-﻿# Changelog
+# Changelog
 
 All notable changes to Sheetly are listed here, newest first.
 Sheetly is in early **alpha**: expect bugs, and please report them in the GitHub issues.
+
+## 0.2.1-alpha
+
+Fixed:
+
+- Comments, hyperlinks and data validation now stay with their cells when you sort, cut and paste, drag, or insert and delete shifted cells. Undo restores them.
+- Conditional formatting saved to `.xlsx` keeps top/bottom, above/below average and all text rules. Text and formula values are written the way Excel expects.
+- Opening `.xlsx` files keeps rule priority, stop-if-true, rules on several ranges, percent rankings, and blank, error and date rules. Icon sets are not supported yet.
+- Conditional formatting follows moved cells and inserted or deleted rows, and cell-value formulas apply relative to each cell.
+- Moving cells to another sheet keeps their formulas and references pointing at the right sheet.
 
 ## 0.2.0-alpha
 

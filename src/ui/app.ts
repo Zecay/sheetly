@@ -8,7 +8,7 @@ import { Border, Cell, CFRule, Sheet, StylePatch, Workbook, isValidDefinedName }
 import { changeDecimals, FMT_ACCOUNTING, FMT_CURRENCY, FMT_PERCENT } from '../core/numfmt';
 import {
   ClipData, FormulaError, PasteMode, SortKey, applyFilter, applyInput, applyStyle, clearFilter, clearRange, copyRange, currentRegion, deleteCols, deleteRows,
-  deleteSheet, displayText, duplicateSheet, eachCell, fillRange, insertCols, insertRows, moveRange, moveSheet, pasteClip, pasteText, removeFilter, renameSheet, sortRange,
+  deleteSheet, displayText, duplicateSheet, eachCell, fillRange, hasSheetExtras, insertCols, insertRows, moveExtras, moveRange, moveSheet, pasteClip, pasteText, removeFilter, renameSheet, sortRange,
 } from '../core/ops';
 import { fromJSON, toJSON } from '../core/serialize';
 import { readXlsx, writeXlsx } from '../core/xlsx';
@@ -1389,7 +1389,15 @@ export class App implements GridHost {
         const touched = new Set<number>([...old.keys(), ...next.keys()]);
         for (const axis of touched) put(line, axis, next.get(axis));
       }
-    });
+      // Notes, links, validation and rules shift with the cells.
+      const from = forward ? start : start + n;
+      const to = forward ? limit - 1 - n : limit - 1;
+      if (from <= to) {
+        const block = horiz ? { r1: l1, r2: l2, c1: from, c2: to } : { r1: from, r2: to, c1: l1, c2: l2 };
+        const d = forward ? n : -n;
+        moveExtras(wb, sheet, block, sheet, horiz ? 0 : d, horiz ? d : 0);
+      }
+    }, hasSheetExtras(wb));
   }
 
   private hideUnhide(cmd: string): void {

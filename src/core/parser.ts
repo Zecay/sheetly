@@ -387,7 +387,7 @@ export function parseFormula(src: string): Node {
 
 export interface RefEditor {
   /** Return the new reference text (without sheet prefix) or null to turn the whole token into #REF!. */
-  (sheet: string | undefined, a: RefPart, b: RefPart | undefined, whole: 'col' | 'row' | undefined): { a: RefPart; b?: RefPart } | null;
+  (sheet: string | undefined, a: RefPart, b: RefPart | undefined, whole: 'col' | 'row' | undefined): { a: RefPart; b?: RefPart; sheet?: string } | null;
 }
 
 export function refText(a: RefPart, b?: RefPart, whole?: 'col' | 'row'): string {
@@ -408,7 +408,8 @@ export function rewriteRefs(formula: string, edit: RefEditor): string {
     pos = t.end;
     const rg = t.range!;
     const res = edit(t.sheet, rg.a, rg.b, rg.whole);
-    const prefix = t.sheet !== undefined ? quoteSheet(t.sheet) + '!' : '';
+    const target = res?.sheet ?? t.sheet;
+    const prefix = target !== undefined ? quoteSheet(target) + '!' : '';
     if (!res) out += '#REF!';
     else out += prefix + refText(res.a, res.b, rg.whole);
   }

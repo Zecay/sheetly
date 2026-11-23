@@ -60,6 +60,10 @@ export interface CFRule {
   v1?: string;
   v2?: string;
   n?: number; // top/bottom N
+  percent?: boolean; // top/bottom: n is a percentage
+  equal?: boolean; // above/below: include the average itself
+  stdDev?: number; // above/below: this many standard deviations from the average
+  stop?: boolean; // no lower-priority rule applies once this one matches
   style?: { color?: string; fill?: string; bold?: boolean; italic?: boolean };
   colors?: string[]; // color scale
   barColor?: string;

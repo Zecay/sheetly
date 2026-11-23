@@ -4,14 +4,14 @@ A small, fast, offline spreadsheet for Windows. It looks and feels like a modern
 ribbon tabs, a formula bar with `fx`, name box, a virtualized grid of 1,048,576 rows × 16,384 columns (A to XFD),
 sheet tabs, a status bar with Average / Count / Sum, zoom, and light and dark mode.
 
-> **Early alpha (0.2.0-alpha).** Expect bugs. Please open an issue if you find one. See [CHANGELOG.md](CHANGELOG.md).
+> **Early alpha (0.2.1-alpha).** Expect bugs. Please open an issue if you find one. See [CHANGELOG.md](CHANGELOG.md).
 
 Sheetly is an independent project and is not affiliated with Microsoft. It never connects to the internet and collects no data.
 Released under the [MIT license](LICENSE).
 
 ## Install (friends: read this)
 
-1. Get `Sheetly_0.2.0_x64-setup.exe` (the installer) from whoever sent it to you. It is about 1.2 MB.
+1. Get `Sheetly_0.2.1_x64-setup.exe` (the installer) from whoever sent it to you. It is about 1.2 MB.
 2. Double-click it. It installs for your user only, so no administrator password is needed.
 3. **Windows SmartScreen will warn you.** Sheetly is not code-signed (a signing certificate costs money), so Windows
    shows *"Windows protected your PC"*. This is expected for any unsigned app.
@@ -61,7 +61,7 @@ npm run tauri build     # produces the installer and the exe
 Output:
 
 - `src-tauri/target/release/sheetly.exe` (portable, 3.2 MB)
-- `src-tauri/target/release/bundle/nsis/Sheetly_0.2.0_x64-setup.exe` (installer, 1.2 MB)
+- `src-tauri/target/release/bundle/nsis/Sheetly_0.2.1_x64-setup.exe` (installer, 1.2 MB)
 
 The release profile uses `opt-level = "s"`, `lto = true`, `codegen-units = 1`, `strip = true`, `panic = "abort"`.
 

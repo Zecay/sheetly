@@ -897,13 +897,13 @@ export function openCF(app: App, kind: string): void {
 function ruleText(r: CFRule): string {
   switch (r.type) {
     case 'cell': return `Cell Value ${r.op === 'between' ? 'between ' + r.v1 + ' and ' + r.v2 : r.op + ' ' + r.v1}`;
-    case 'text': return `Text contains "${r.v1}"`;
+    case 'text': return `Text ${{ notcontains: 'does not contain', begins: 'begins with', ends: 'ends with' }[r.op ?? ''] ?? 'contains'} "${r.v1}"`;
     case 'dup': return 'Duplicate Values';
     case 'unique': return 'Unique Values';
-    case 'top': return `Top ${r.n ?? 10}`;
-    case 'bottom': return `Bottom ${r.n ?? 10}`;
-    case 'above': return 'Above Average';
-    case 'below': return 'Below Average';
+    case 'top': return `Top ${r.n ?? 10}${r.percent ? '%' : ''}`;
+    case 'bottom': return `Bottom ${r.n ?? 10}${r.percent ? '%' : ''}`;
+    case 'above': return r.equal ? 'Equal to or Above Average' : 'Above Average';
+    case 'below': return r.equal ? 'Equal to or Below Average' : 'Below Average';
     case 'scale': return `${r.colors?.length ?? 2}-Color Scale`;
     case 'bar': return 'Data Bar';
     default: return 'Formula: ' + (r.v1 ?? '');

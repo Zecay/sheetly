@@ -20,6 +20,7 @@ interface RuleStats {
   max: number;
   mid: number;
   avg: number;
+  sd: number;
   counts?: Map<string, number>;
   sorted?: number[];
 }
@@ -108,7 +109,8 @@ export class CFEngine {
     const max = nums.length ? nums[nums.length - 1] : 0;
     const mid = nums.length ? (nums.length % 2 ? nums[nums.length >> 1] : (nums[(nums.length >> 1) - 1] + nums[nums.length >> 1]) / 2) : 0;
     const avg = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : 0;
-    st = { version: this.wb.dataVersion, min, max, mid, avg, counts, sorted: nums };
+    const sd = nums.length ? Math.sqrt(nums.reduce((a, b) => a + (b - avg) * (b - avg), 0) / nums.length) : 0;
+    st = { version: this.wb.dataVersion, min, max, mid, avg, sd, counts, sorted: nums };
     this.stats.set(rule.id, st);
     this.pruneStats();
     return st;
@@ -139,6 +141,7 @@ export class CFEngine {
       if (res.bold && out.bold === undefined) out.bold = res.bold;
       if (res.italic && out.italic === undefined) out.italic = res.italic;
       if (res.bar && !out.bar) out.bar = res.bar;
+      if (rule.stop) break;
     }
     return out;
   }
@@ -149,10 +152,12 @@ export class CFEngine {
     switch (rule.type) {
       case 'cell': {
         if (v === null || v instanceof FErr) return rule.op === '<>' && v === null ? hit() : null;
-        const a = evalText(this.wb, sheet, rule.rect.r1, rule.rect.c1, rule.v1 ?? '');
+        // A formula operand is written for the rule's first cell and follows each cell, like Excel.
+        const operand = (t: string) => evalText(this.wb, sheet, r, c, t.trim().startsWith('=') ? '=' + shiftFormula(t.trim().slice(1), r - rule.rect.r1, c - rule.rect.c1) : t);
+        const a = operand(rule.v1 ?? '');
         const op = rule.op ?? '>';
         if (op === 'between' || op === 'notbetween') {
-          const b = evalText(this.wb, sheet, rule.rect.r1, rule.rect.c1, rule.v2 ?? '');
+          const b = operand(rule.v2 ?? '');
           if (typeof v === 'number' && typeof a === 'number' && typeof b === 'number') {
             const inside = v >= Math.min(a, b) && v <= Math.max(a, b);
             return (op === 'between') === inside ? hit() : null;
@@ -185,8 +190,8 @@ export class CFEngine {
       case 'bottom': {
         if (typeof v !== 'number') return null;
         const st = this.statsFor(sheet, rule);
-        const n = Math.max(1, rule.n ?? 10);
         const arr = st.sorted!;
+        const n = Math.max(1, rule.percent ? Math.floor((arr.length * (rule.n ?? 10)) / 100) : rule.n ?? 10);
         if (rule.type === 'top') return v >= arr[Math.max(0, arr.length - n)] ? hit() : null;
         return v <= arr[Math.min(arr.length - 1, n - 1)] ? hit() : null;
       }
@@ -194,7 +199,9 @@ export class CFEngine {
       case 'below': {
         if (typeof v !== 'number') return null;
         const st = this.statsFor(sheet, rule);
-        return (rule.type === 'above' ? v > st.avg : v < st.avg) ? hit() : null;
+        const off = (rule.stdDev ?? 0) * st.sd;
+        const ok = rule.type === 'above' ? (rule.equal ? v >= st.avg + off : v > st.avg + off) : rule.equal ? v <= st.avg - off : v < st.avg - off;
+        return ok ? hit() : null;
       }
       case 'formula': {
         const base = (rule.v1 ?? '').replace(/^=/, '');

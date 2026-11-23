@@ -1,6 +1,6 @@
 // Editing operations on a workbook: input, clear, insert/delete, fill, sort, copy/move, find.
 import { MAX_COLS, MAX_ROWS, Rect, cellKey, keyCol, keyRow, normRect } from './addr';
-import { Cell, CFRule, Sheet, StylePatch, Workbook, cleanSheetName } from './model';
+import { Cell, CFRule, DataValidation, Sheet, StylePatch, Workbook, cleanSheetName } from './model';
 import { parseInput } from './input';
 import { ParseError, RefEditor, RefPart, parseFormula, rewriteRefs, shiftFormula } from './parser';
 import { FErr, Value, DAYS, MONTHS, isErr } from './values';
@@ -154,6 +154,12 @@ function adjustRect(rect: Rect, axis: Axis, at: number, delta: number): Rect | n
 
 /** Apply a formula edit to a sheet's data validations and internal hyperlinks. */
 function editSheetExtras(s: Sheet, edit: (f: string) => string): void {
+  const operand = (t: string | undefined) => (t?.trim().startsWith('=') ? '=' + edit(t.trim().slice(1)) : t);
+  s.cf = s.cf.map((r) => {
+    if (r.type === 'cell') return { ...r, v1: operand(r.v1), v2: operand(r.v2) };
+    if (r.type === 'formula' && r.v1 !== undefined) return { ...r, v1: r.v1.trim().startsWith('=') ? operand(r.v1) : edit(r.v1) };
+    return r;
+  });
   s.validations = s.validations.map((v) => ({
     ...v,
     f1: v.f1 === undefined ? undefined : edit(v.f1),
@@ -521,35 +527,205 @@ export function moveRange(wb: Workbook, srcSheet: Sheet, src: Rect, dstSheet: Sh
   const dc = c - src.c1;
   const dst: Rect = { r1: r, c1: c, r2: src.r2 + dr, c2: src.c2 + dc };
   if (dst.r2 >= MAX_ROWS || dst.c2 >= MAX_COLS) return src;
-  const grabbed: [number, number, Cell][] = [];
-  eachCell(srcSheet, src, (rr, cc, cell) => grabbed.push([rr, cc, cell]));
-  // clear source and destination
-  const clearDst: [number, number][] = [];
-  eachCell(dstSheet, dst, (rr, cc) => clearDst.push([rr, cc]));
-  for (const [rr, cc] of clearDst) wb.setCell(dstSheet, rr, cc, undefined);
-  for (const [rr, cc] of grabbed) wb.setCell(srcSheet, rr, cc, undefined);
-  for (const [rr, cc, cell] of grabbed) wb.setCell(dstSheet, rr + dr, cc + dc, { v: cell.v, f: cell.f, s: cell.s });
-  // fix references into the moved block, everywhere
-  const sl = srcSheet.name.toLowerCase();
-  for (const s of wb.sheets) {
-    const edit: RefEditor = (sheetName, a, b, whole) => {
-      const sh = (sheetName === undefined ? s.name : sheetName).toLowerCase();
-      if (sh !== sl || whole) return { a, b };
-      const inside = (p: RefPart) => p.r >= src.r1 && p.r <= src.r2 && p.c >= src.c1 && p.c <= src.c2;
-      const mv = (p: RefPart): RefPart => ({ ...p, r: p.r + dr, c: p.c + dc });
-      if (!b) return inside(a) ? { a: mv(a) } : { a, b };
-      if (inside(a) && inside(b)) return { a: mv(a), b: mv(b) };
-      return { a, b };
-    };
-    const updates: [number, Cell][] = [];
-    for (const [k, cell] of s.cells) {
-      if (cell.f === undefined) continue;
-      const nf = rewriteRefs(cell.f, edit);
-      if (nf !== cell.f) updates.push([k, { v: cell.v, f: nf, s: cell.s }]);
+  // Comments, links, validation and rules live outside the cell journal, so undo needs a full snapshot for them.
+  return wb.transact('Move cells', () => {
+    const cross = srcSheet !== dstSheet;
+    const grabbed: [number, number, Cell][] = [];
+    eachCell(srcSheet, src, (rr, cc, cell) => grabbed.push([rr, cc, cell]));
+    // clear source and destination
+    const clearDst: [number, number][] = [];
+    eachCell(dstSheet, dst, (rr, cc) => clearDst.push([rr, cc]));
+    for (const [rr, cc] of clearDst) wb.setCell(dstSheet, rr, cc, undefined);
+    for (const [rr, cc] of grabbed) wb.setCell(srcSheet, rr, cc, undefined);
+    // On another sheet, a moved formula must keep pointing at the sheet it came from.
+    for (const [rr, cc, cell] of grabbed) wb.setCell(dstSheet, rr + dr, cc + dc, { v: cell.v, f: cell.f !== undefined && cross ? qualifyRefs(cell.f, srcSheet.name) : cell.f, s: cell.s });
+    moveExtras(wb, srcSheet, src, dstSheet, dr, dc);
+    // fix references into the moved block, everywhere
+    const sl = srcSheet.name.toLowerCase();
+    const target = cross ? { sheet: dstSheet.name } : {};
+    for (const s of wb.sheets) {
+      const edit: RefEditor = (sheetName, a, b, whole) => {
+        const sh = (sheetName === undefined ? s.name : sheetName).toLowerCase();
+        if (sh !== sl || whole) return { a, b };
+        const inside = (p: RefPart) => p.r >= src.r1 && p.r <= src.r2 && p.c >= src.c1 && p.c <= src.c2;
+        const mv = (p: RefPart): RefPart => ({ ...p, r: p.r + dr, c: p.c + dc });
+        if (!b) return inside(a) ? { a: mv(a), ...target } : { a, b };
+        if (inside(a) && inside(b)) return { a: mv(a), b: mv(b), ...target };
+        return { a, b };
+      };
+      const updates: [number, Cell][] = [];
+      for (const [k, cell] of s.cells) {
+        if (cell.f === undefined) continue;
+        const nf = rewriteRefs(cell.f, edit);
+        if (nf !== cell.f) updates.push([k, { v: cell.v, f: nf, s: cell.s }]);
+      }
+      for (const [k, nc] of updates) wb.setCell(s, keyRow(k), keyCol(k), nc);
+      editSheetExtras(s, (f) => rewriteRefs(f, edit));
     }
-    for (const [k, nc] of updates) wb.setCell(s, keyRow(k), keyCol(k), nc);
+    return dst;
+  }, hasSheetExtras(wb));
+}
+
+// ---------------- comments, links, validation and rules that travel with cells ----------------
+
+export function hasSheetExtras(wb: Workbook): boolean {
+  return wb.sheets.some((s) => s.cf.length || s.hyperlinks.length || s.comments.length || s.validations.length);
+}
+
+function intersectRect(a: Rect, b: Rect): Rect | null {
+  const r1 = Math.max(a.r1, b.r1);
+  const c1 = Math.max(a.c1, b.c1);
+  const r2 = Math.min(a.r2, b.r2);
+  const c2 = Math.min(a.c2, b.c2);
+  return r1 > r2 || c1 > c2 ? null : { r1, c1, r2, c2 };
+}
+
+/** The parts of a that lie outside b, as up to four rectangles. */
+function subtractRect(a: Rect, b: Rect): Rect[] {
+  const i = intersectRect(a, b);
+  if (!i) return [a];
+  const out: Rect[] = [];
+  if (a.r1 < i.r1) out.push({ ...a, r2: i.r1 - 1 });
+  if (i.c1 > a.c1) out.push({ r1: i.r1, r2: i.r2, c1: a.c1, c2: i.c1 - 1 });
+  if (i.c2 < a.c2) out.push({ r1: i.r1, r2: i.r2, c1: i.c2 + 1, c2: a.c2 });
+  if (a.r2 > i.r2) out.push({ ...a, r1: i.r2 + 1 });
+  return out;
+}
+
+const containsRect = (outer: Rect, x: Rect) => x.r1 >= outer.r1 && x.r2 <= outer.r2 && x.c1 >= outer.c1 && x.c2 <= outer.c2;
+const offsetRect = (x: Rect, dr: number, dc: number): Rect => ({ r1: x.r1 + dr, c1: x.c1 + dc, r2: x.r2 + dr, c2: x.c2 + dc });
+
+/** Shift relative references in formula text that may start with "=". */
+function shiftText(f: string | undefined, dr: number, dc: number): string | undefined {
+  if (f === undefined) return f;
+  const t = f.trim();
+  return t.startsWith('=') ? '=' + shiftFormula(t.slice(1), dr, dc) : shiftFormula(t, dr, dc);
+}
+
+/** Give every reference without a sheet an explicit one. */
+function qualifyRefs(f: string, sheetName: string): string {
+  return rewriteRefs(f, (sn, a, b) => (sn === undefined ? { a, b, sheet: sheetName } : { a, b }));
+}
+function qualifyText(f: string | undefined, sheetName: string): string | undefined {
+  if (f === undefined) return f;
+  const t = f.trim();
+  return t.startsWith('=') ? '=' + qualifyRefs(t.slice(1), sheetName) : qualifyRefs(t, sheetName);
+}
+
+// These rules compare a cell with the rest of their range, so splitting one would change its result.
+const RANGE_RULES = new Set<CFRule['type']>(['dup', 'unique', 'top', 'bottom', 'above', 'below', 'scale', 'bar']);
+
+/**
+ * Move notes, links, validation and conditional formats from src by (dr, dc).
+ * Whatever already covered the destination is replaced, as the cells there are.
+ */
+export function moveExtras(wb: Workbook, srcSheet: Sheet, src: Rect, dstSheet: Sheet, dr: number, dc: number): void {
+  if (!dr && !dc && srcSheet === dstSheet) return;
+  const dst = offsetRect(src, dr, dc);
+  const cross = srcSheet !== dstSheet;
+  const cutsFor = (s: Sheet) => (cross ? (s === srcSheet ? [src] : [dst]) : [src, dst]);
+  const remain = (x: Rect, s: Sheet) => cutsFor(s).reduce((parts, cut) => parts.flatMap((p) => subtractRect(p, cut)), [x]);
+  const sheets = cross ? [srcSheet, dstSheet] : [srcSheet];
+  const carry = (f: string | undefined) => (cross ? qualifyText(f, srcSheet.name) : f);
+
+  // notes
+  const notes = srcSheet.comments.filter((n) => containsRect(src, { r1: n.r, c1: n.c, r2: n.r, c2: n.c })).map((n) => ({ ...n, r: n.r + dr, c: n.c + dc }));
+  for (const s of sheets) s.comments = s.comments.filter((n) => !cutsFor(s).some((x) => containsRect(x, { r1: n.r, c1: n.c, r2: n.r, c2: n.c })));
+  dstSheet.comments.push(...notes);
+
+  // links
+  const links = srcSheet.hyperlinks.flatMap((h) => {
+    const i = intersectRect(h.rect, src);
+    return i ? [{ ...h, rect: offsetRect(i, dr, dc) }] : [];
+  });
+  for (const s of sheets) s.hyperlinks = s.hyperlinks.flatMap((h) => remain(h.rect, s).map((rect) => ({ ...h, rect })));
+  dstSheet.hyperlinks.push(...links);
+
+  // validation: formulas are relative to the first cell of the first range
+  const moveRefs = (v: DataValidation, from: Rect) => {
+    const a = v.rects[0];
+    return { f1: carry(v.f1 === undefined ? undefined : shiftText(v.f1, from.r1 - a.r1, from.c1 - a.c1)), f2: carry(v.f2 === undefined ? undefined : shiftText(v.f2, from.r1 - a.r1, from.c1 - a.c1)) };
+  };
+  const movedRules = srcSheet.validations.flatMap((v) => {
+    const parts = v.rects.map((x) => intersectRect(x, src)).filter((x): x is Rect => !!x);
+    return parts.length ? [{ ...v, ...moveRefs(v, parts[0]), rects: parts.map((x) => offsetRect(x, dr, dc)) }] : [];
+  });
+  for (const s of sheets) {
+    s.validations = s.validations.flatMap((v) => {
+      const rects = v.rects.flatMap((x) => remain(x, s));
+      if (!rects.length) return [];
+      const a = v.rects[0];
+      const moved = rects.length !== v.rects.length || rects.some((x, i) => x !== v.rects[i]);
+      return [moved ? { ...v, rects, f1: shiftText(v.f1, rects[0].r1 - a.r1, rects[0].c1 - a.c1), f2: shiftText(v.f2, rects[0].r1 - a.r1, rects[0].c1 - a.c1) } : v];
+    });
   }
-  return dst;
+  dstSheet.validations.push(...movedRules);
+
+  // conditional formats, keeping their priority order on the same sheet
+  const relative = (rule: CFRule, f: string | undefined) => rule.type === 'formula' || (rule.type === 'cell' && !!f?.trim().startsWith('='));
+  const piece = (rule: CFRule, part: Rect, rect: Rect, qualify: boolean): CFRule => {
+    const fix = (f: string | undefined) => {
+      if (!relative(rule, f)) return f;
+      const shifted = shiftText(f, part.r1 - rule.rect.r1, part.c1 - rule.rect.c1);
+      return qualify ? qualifyText(shifted, srcSheet.name) : shifted;
+    };
+    return { ...rule, id: wb.nextRuleId++, rect, v1: fix(rule.v1), v2: fix(rule.v2) };
+  };
+  const keep = (rule: CFRule, s: Sheet): CFRule[] => {
+    if (!cutsFor(s).some((x) => intersectRect(rule.rect, x))) return [rule];
+    if (RANGE_RULES.has(rule.type)) return cutsFor(s).some((x) => containsRect(x, rule.rect)) ? [] : [rule];
+    return remain(rule.rect, s).map((p) => piece(rule, p, p, false));
+  };
+  const carried = (rule: CFRule): CFRule[] => {
+    const i = intersectRect(rule.rect, src);
+    if (!i || (RANGE_RULES.has(rule.type) && !containsRect(src, rule.rect))) return [];
+    return [piece(rule, i, offsetRect(i, dr, dc), cross)];
+  };
+  if (cross) {
+    const moved = srcSheet.cf.flatMap(carried);
+    srcSheet.cf = srcSheet.cf.flatMap((x) => keep(x, srcSheet));
+    dstSheet.cf = [...dstSheet.cf.flatMap((x) => keep(x, dstSheet)), ...moved];
+  } else {
+    srcSheet.cf = srcSheet.cf.flatMap((x) => [...keep(x, srcSheet), ...carried(x)]);
+  }
+}
+
+/** Sort moved whole rows of cells: take the notes, links and validation of those cells along. */
+function sortExtras(sheet: Sheet, body: Rect, rowTo: Map<number, number>): void {
+  const inside = (r: number, c: number) => r >= body.r1 && r <= body.r2 && c >= body.c1 && c <= body.c2;
+  sheet.comments = sheet.comments.map((n) => (inside(n.r, n.c) ? { ...n, r: rowTo.get(n.r) ?? n.r } : n));
+  /** Rectangles after the sort; null when the sort cannot change them. */
+  const remap = (x: Rect): Rect[] | null => {
+    const i = intersectRect(x, body);
+    if (!i || (i.r1 === body.r1 && i.r2 === body.r2)) return null;
+    const rows: number[] = [];
+    for (let r = i.r1; r <= i.r2; r++) rows.push(rowTo.get(r) ?? r);
+    rows.sort((a, b) => a - b);
+    const out = subtractRect(x, i);
+    let start = rows[0];
+    for (let k = 1; k <= rows.length; k++) {
+      if (k < rows.length && rows[k] === rows[k - 1] + 1) continue;
+      out.push({ r1: start, r2: rows[k - 1], c1: i.c1, c2: i.c2 });
+      start = rows[k];
+    }
+    return out;
+  };
+  sheet.hyperlinks = sheet.hyperlinks.flatMap((h) => {
+    const next = remap(h.rect);
+    return next ? next.map((rect) => ({ ...h, rect })) : [h];
+  });
+  sheet.validations = sheet.validations.map((v) => {
+    let changed = false;
+    const rects = v.rects.flatMap((x) => {
+      const next = remap(x);
+      if (next) changed = true;
+      return next ?? [x];
+    });
+    if (!changed) return v;
+    const dr = rects[0].r1 - v.rects[0].r1;
+    const dc = rects[0].c1 - v.rects[0].c1;
+    return { ...v, rects, f1: shiftText(v.f1, dr, dc), f2: shiftText(v.f2, dr, dc) };
+  });
 }
 
 // ---------------- fill ----------------
@@ -740,7 +916,13 @@ export function sortRange(wb: Workbook, sheet: Sheet, rect: Rect, keys: SortKey[
     }
     return a.orig - b.orig;
   });
+  const hasExtras = sheet.comments.length > 0 || sheet.hyperlinks.length > 0 || sheet.validations.length > 0;
   wb.transact('Sort', () => {
+    if (hasExtras) {
+      const rowTo = new Map<number, number>();
+      sorted.forEach((row, i) => rowTo.set(row.orig, r1 + i));
+      sortExtras(sheet, { r1, c1: rect.c1, r2: rect.r2, c2: rect.c2 }, rowTo);
+    }
     sorted.forEach((row, i) => {
       const tr = r1 + i;
       for (let j = 0; j < row.cells.length; j++) {
@@ -752,7 +934,7 @@ export function sortRange(wb: Workbook, sheet: Sheet, rect: Rect, keys: SortKey[
         wb.setCell(sheet, tr, tc, nc);
       }
     });
-  });
+  }, hasExtras);
 }
 
 // ---------------- filter ----------------

@@ -6,7 +6,7 @@ import { Border, CFRule, Cell, CellComment, CellStyle, DataValidation, Hyperlink
 import { normalizeSheetNames } from './ops';
 import { XNode, child, esc, escText, kids, parseXml } from './xml';
 import { E, FErr, Value, errFromCode, ymdToSerial } from './values';
-import { shiftFormula, tokenize } from './parser';
+import { parseFormula, shiftFormula, tokenize } from './parser';
 
 // Excel's limits
 const MAX_CELL_TEXT = 32767;
@@ -301,6 +301,33 @@ function stripXlfn(f: string): string {
   return f.replace(/_xlfn\.|_xlws\./g, '');
 }
 
+const isCfLiteral = (t: string) => t === '' || /^[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?$/i.test(t) || /^".*"$/s.test(t) || /^(true|false)$/i.test(t);
+
+/** In a file a cell-value operand is always a formula; Sheetly marks non-literals with "=". */
+function readCfOperand(f: string | undefined): string | undefined {
+  if (f === undefined) return undefined;
+  const t = f.trim();
+  return isCfLiteral(t) ? t : '=' + t;
+}
+
+/** Sheetly's dialog accepts plain text like abc, which a file must store as the formula "abc". */
+function writeCfOperand(v: string | undefined): string {
+  const t = (v ?? '').trim();
+  if (t.startsWith('=')) return t.slice(1);
+  if (t === '') return '""';
+  return isCfLiteral(t) ? t : `"${t.replace(/"/g, '""')}"`;
+}
+
+/** A rule Excel could not parse would trigger its repair prompt, so it is left out of the file. */
+function validCfFormula(f: string): boolean {
+  try {
+    parseFormula(f);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /** Hyperlinks, comments and data validation of one worksheet. */
 function readSheetExtras(sheet: Sheet, root: XNode, path: string, get: (name: string) => string | undefined): void {
   const slash = path.lastIndexOf('/');
@@ -459,21 +486,31 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
     if (r) sheet.filter = { rect: r, cols: new Map() };
   }
   // conditional formatting
-  for (const cf of kids(root, 'conditionalFormatting')) {
-    const rect = parseRect((cf.attrs.sqref ?? '').split(' ')[0]);
-    if (!rect) continue;
-    for (const rule of kids(cf, 'cfRule')) {
+  // Excel's priority decides which rule wins, and it need not match the order in the file.
+  const cfEntries = kids(root, 'conditionalFormatting').flatMap((cf) => kids(cf, 'cfRule').map((rule) => ({ cf, rule })));
+  const prio = (x: XNode) => {
+    const p = parseInt(x.attrs.priority ?? '', 10);
+    return Number.isFinite(p) ? p : Number.MAX_SAFE_INTEGER;
+  };
+  cfEntries.sort((a, b) => prio(a.rule) - prio(b.rule));
+  for (const { cf, rule } of cfEntries) {
+    const rects = (cf.attrs.sqref ?? '').split(/\s+/).map(parseRect).filter((x): x is Rect => !!x);
+    if (!rects.length) continue;
+    for (const rect of rects) {
       const base: CFRule = { id: wb.nextRuleId++, rect, type: 'cell' };
       const dx = rule.attrs.dxfId !== undefined ? dxfs[parseInt(rule.attrs.dxfId, 10)] : undefined;
       if (dx) base.style = { color: dx.color, fill: dx.fill, bold: dx.bold, italic: dx.italic };
-      const fs = kids(rule, 'formula').map((x) => stripXlfn(x.text));
+      if (rule.attrs.stopIfTrue === '1' || rule.attrs.stopIfTrue === 'true') base.stop = true;
+      // Formulas are written for the first range's first cell, so each extra range gets its own offset.
+      const fs = kids(rule, 'formula').map((x) => shiftFormula(stripXlfn(x.text), rect.r1 - rects[0].r1, rect.c1 - rects[0].c1));
+      const on = (v: string | undefined) => v === '1' || v === 'true';
       switch (rule.attrs.type) {
         case 'cellIs': {
           const opMap: Record<string, string> = { greaterThan: '>', lessThan: '<', greaterThanOrEqual: '>=', lessThanOrEqual: '<=', equal: '=', notEqual: '<>', between: 'between', notBetween: 'notbetween' };
           base.type = 'cell';
           base.op = opMap[rule.attrs.operator ?? ''] ?? '>';
-          base.v1 = fs[0];
-          base.v2 = fs[1];
+          base.v1 = readCfOperand(fs[0]);
+          base.v2 = readCfOperand(fs[1]);
           break;
         }
         case 'expression':
@@ -481,10 +518,25 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
           base.v1 = fs[0];
           break;
         case 'containsText':
+        case 'notContainsText':
+        case 'beginsWith':
+        case 'endsWith':
           base.type = 'text';
-          base.op = 'contains';
+          base.op = { containsText: 'contains', notContainsText: 'notcontains', beginsWith: 'begins', endsWith: 'ends' }[rule.attrs.type];
           base.v1 = rule.attrs.text ?? '';
           break;
+        case 'top10':
+          base.type = on(rule.attrs.bottom) ? 'bottom' : 'top';
+          base.n = Math.max(1, parseInt(rule.attrs.rank ?? '10', 10) || 10);
+          if (on(rule.attrs.percent)) base.percent = true;
+          break;
+        case 'aboveAverage': {
+          base.type = rule.attrs.aboveAverage === '0' || rule.attrs.aboveAverage === 'false' ? 'below' : 'above';
+          if (on(rule.attrs.equalAverage)) base.equal = true;
+          const sd = parseInt(rule.attrs.stdDev ?? '', 10);
+          if (sd > 0) base.stdDev = sd;
+          break;
+        }
         case 'duplicateValues':
           base.type = 'dup';
           break;
@@ -506,7 +558,10 @@ function readSheet(wb: Workbook, sheet: Sheet, root: XNode, sst: string[], xfSty
           break;
         }
         default:
-          continue;
+          // Blanks, errors and date rules carry an equivalent formula. Icon sets have none and are not supported.
+          if (!fs[0]) continue;
+          base.type = 'formula';
+          base.v1 = fs[0];
       }
       sheet.cf.push(base);
     }
@@ -845,23 +900,41 @@ export function writeXlsx(wb: Workbook): Uint8Array {
     let prio = 1;
     for (const rule of sheet.cf) {
       const sq = rectText(rule.rect);
-      const st = rule.style ? ` dxfId="${dxfOf(rule.style)}"` : '';
+      const dxf = rule.style ? ` dxfId="${dxfOf(rule.style)}"` : '';
+      const st = dxf + (rule.stop ? ' stopIfTrue="1"' : '');
       let body = '';
       switch (rule.type) {
         case 'cell': {
           const opMap: Record<string, string> = { '>': 'greaterThan', '<': 'lessThan', '>=': 'greaterThanOrEqual', '<=': 'lessThanOrEqual', '=': 'equal', '<>': 'notEqual', between: 'between', notbetween: 'notBetween' };
-          body = `<cfRule type="cellIs"${st} priority="${prio++}" operator="${opMap[rule.op ?? '>']}"><formula>${escText(rule.v1 ?? '0')}</formula>${rule.op === 'between' || rule.op === 'notbetween' ? `<formula>${escText(rule.v2 ?? '0')}</formula>` : ''}</cfRule>`;
+          const two = rule.op === 'between' || rule.op === 'notbetween';
+          const f1 = writeCfOperand(rule.v1);
+          const f2 = writeCfOperand(rule.v2);
+          if (!validCfFormula(f1) || (two && !validCfFormula(f2))) break;
+          body = `<cfRule type="cellIs"${st} priority="${prio++}" operator="${opMap[rule.op ?? '>']}"><formula>${escText(addXlfn(f1, renamedNames))}</formula>${two ? `<formula>${escText(addXlfn(f2, renamedNames))}</formula>` : ''}</cfRule>`;
           break;
         }
-        case 'formula':
-          body = `<cfRule type="expression"${st} priority="${prio++}"><formula>${escText(rule.v1 ?? 'FALSE')}</formula></cfRule>`;
+        case 'formula': {
+          const f = (rule.v1 ?? 'FALSE').trim().replace(/^=/, '');
+          if (!validCfFormula(f)) break;
+          body = `<cfRule type="expression"${st} priority="${prio++}"><formula>${escText(addXlfn(f, renamedNames))}</formula></cfRule>`;
           break;
+        }
         case 'text': {
           const first = a1(rule.rect.r1, rule.rect.c1);
           const t = rule.v1 ?? '';
-          body = `<cfRule type="containsText"${st} priority="${prio++}" operator="containsText" text="${esc(t)}"><formula>NOT(ISERROR(SEARCH("${esc(t.replace(/"/g, '""'))}",${first})))</formula></cfRule>`;
+          const q = `"${t.replace(/"/g, '""')}"`;
+          const kind = { contains: ['containsText', 'containsText', `NOT(ISERROR(SEARCH(${q},${first})))`], notcontains: ['notContainsText', 'notContains', `ISERROR(SEARCH(${q},${first}))`], begins: ['beginsWith', 'beginsWith', `LEFT(${first},LEN(${q}))=${q}`], ends: ['endsWith', 'endsWith', `RIGHT(${first},LEN(${q}))=${q}`] }[rule.op ?? 'contains'] ?? ['containsText', 'containsText', `NOT(ISERROR(SEARCH(${q},${first})))`];
+          body = `<cfRule type="${kind[0]}"${st} priority="${prio++}" operator="${kind[1]}" text="${esc(t)}"><formula>${escText(kind[2])}</formula></cfRule>`;
           break;
         }
+        case 'top':
+        case 'bottom':
+          body = `<cfRule type="top10"${st} priority="${prio++}"${rule.percent ? ' percent="1"' : ''}${rule.type === 'bottom' ? ' bottom="1"' : ''} rank="${Math.max(1, Math.min(1000, Math.floor(rule.n ?? 10)))}"/>`;
+          break;
+        case 'above':
+        case 'below':
+          body = `<cfRule type="aboveAverage"${st} priority="${prio++}"${rule.type === 'below' ? ' aboveAverage="0"' : ''}${rule.equal ? ' equalAverage="1"' : ''}${rule.stdDev ? ` stdDev="${rule.stdDev}"` : ''}/>`;
+          break;
         case 'dup':
           body = `<cfRule type="duplicateValues"${st} priority="${prio++}"/>`;
           break;
